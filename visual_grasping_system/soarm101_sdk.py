@@ -401,17 +401,36 @@ class SOARM101Controller:
         return angles if final_error < 0.02 else None
     
     def get_current_xyz(self) -> np.ndarray:
-        """获取当前末端位置 (米)"""
+        """获取当前末端位置 (米) - URDF坐标系"""
         angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions[:5]])
         self._current_xyz = self.forward_kinematics(angles)
         return self._current_xyz
     
+    def get_user_position(self) -> dict:
+        """
+        获取用户友好的末端位置
+        
+        用户坐标系 (站在机械臂后方):
+        - forward: 前方距离 (正值表示向前)
+        - left: 左侧距离 (正值表示向左)
+        - up: 高度 (正值表示向上)
+        
+        Returns:
+            dict: {'forward': mm, 'left': mm, 'up': mm}
+        """
+        urdf_pos = self.get_current_xyz()
+        return {
+            'forward': urdf_pos[2] * 1000,   # Z轴 → 前
+            'left': -urdf_pos[0] * 1000,     # -X轴 → 左
+            'up': -urdf_pos[1] * 1000        # -Y轴 → 上
+        }
+    
     def move_to_xyz(self, target_xyz: List[float], duration: float = 1.5) -> bool:
         """
-        移动到目标笛卡尔坐标
+        移动到目标笛卡尔坐标 (URDF坐标系)
         
         Args:
-            target_xyz: 目标位置 (x, y, z) 米
+            target_xyz: 目标位置 (x, y, z) 米 - URDF坐标系
             duration: 运动时间
             
         Returns:
@@ -422,11 +441,16 @@ class SOARM101Controller:
             return False
         
         target = np.array(target_xyz)
-        print(f"[MOVE_XYZ] 目标位置: x={target[0]*1000:.1f}mm, y={target[1]*1000:.1f}mm, z={target[2]*1000:.1f}mm")
+        
+        target_user = {
+            'forward': target[2] * 1000,
+            'left': -target[0] * 1000,
+            'up': -target[1] * 1000
+        }
+        print(f"[MOVE_XYZ] 目标: 前{target_user['forward']:.1f}mm, 左{target_user['left']:.1f}mm, 上{target_user['up']:.1f}mm")
         
         current_angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions[:5]])
         current_pos = self.forward_kinematics(current_angles)
-        print(f"[MOVE_XYZ] 当前位置: x={current_pos[0]*1000:.1f}mm, y={current_pos[1]*1000:.1f}mm, z={current_pos[2]*1000:.1f}mm")
         
         target_angles = self.inverse_kinematics(target, current_angles)
         if target_angles is None:
@@ -446,10 +470,20 @@ class SOARM101Controller:
         """
         相对移动 (笛卡尔空间)
         
+        用户坐标系 (站在机械臂后方):
+        - dx: 前/后移动 (前为正)
+        - dy: 左/右移动 (左为正)
+        - dz: 上/下移动 (上为正)
+        
+        URDF坐标系映射:
+        - 前/后 → Z轴
+        - 左/右 → X轴 (反向)
+        - 上/下 → Y轴 (反向)
+        
         Args:
-            dx: X方向移动量 (米), 正方向为前方
-            dy: Y方向移动量 (米), 正方向为左方
-            dz: Z方向移动量 (米), 正方向为上方
+            dx: 前后方向移动量 (米)
+            dy: 左右方向移动量 (米)
+            dz: 上下方向移动量 (米)
             duration: 运动时间
             
         Returns:
@@ -460,13 +494,24 @@ class SOARM101Controller:
             return False
         
         current_pos = self.get_current_xyz()
-        target_pos = current_pos + np.array([dx, dy, dz])
         
-        print(f"[MOVE_REL] 相对移动: dx={dx*1000:.1f}mm, dy={dy*1000:.1f}mm, dz={dz*1000:.1f}mm")
-        print(f"[MOVE_REL] 从 ({current_pos[0]*1000:.1f}, {current_pos[1]*1000:.1f}, {current_pos[2]*1000:.1f}) mm")
-        print(f"[MOVE_REL] 到 ({target_pos[0]*1000:.1f}, {target_pos[1]*1000:.1f}, {target_pos[2]*1000:.1f}) mm")
+        target_pos = current_pos + np.array([
+            -dy,
+            -dz,
+            dx
+        ])
         
-        return self.move_to_xyz(target_pos, duration)
+        print(f"[MOVE_REL] 相对移动: 前{dx*1000:.1f}mm, 左{dy*1000:.1f}mm, 上{dz*1000:.1f}mm")
+        
+        user_pos = self.get_user_position()
+        print(f"[MOVE_REL] 当前位置: 前{user_pos['forward']:.1f}mm, 左{user_pos['left']:.1f}mm, 上{user_pos['up']:.1f}mm")
+        
+        result = self.move_to_xyz(target_pos, duration)
+        
+        new_pos = self.get_user_position()
+        print(f"[MOVE_REL] 移动后: 前{new_pos['forward']:.1f}mm, 左{new_pos['left']:.1f}mm, 上{new_pos['up']:.1f}mm")
+        
+        return result
     
     def move_up(self, distance: float = 0.05, duration: float = 1.0) -> bool:
         """向上移动 (米)"""
