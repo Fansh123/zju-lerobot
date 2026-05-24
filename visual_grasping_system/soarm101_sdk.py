@@ -211,11 +211,22 @@ class SOARM101Controller:
     
     JOINT_LIMITS = np.array([
         [-1.92, 1.92], [-1.75, 1.75], [-1.69, 1.69],
-        [-1.66, 1.66], [-2.74, 2.84], [-0.17, 1.75]
+        [-1.66, 1.66], [-2.74, 2.84], [-1.06, 1.22]
     ])
+    
+    GRIPPER_CLOSE_ANGLE = -1.0
+    GRIPPER_OPEN_ANGLE = 1.1
     
     DEFAULT_SPEED = 500
     DEFAULT_ACCELERATION = 50
+    
+    LINK_LENGTHS = {
+        'd1': 0.0624,
+        'a2': 0.11257,
+        'a3': 0.1349,
+        'd4': 0.0611,
+        'd5': 0.0981,
+    }
     
     def __init__(self, port: str = 'COM18'):
         self.bus = FeetechSTS(port, baudrate=1000000)
@@ -223,19 +234,24 @@ class SOARM101Controller:
         self.current_positions = np.full(6, FeetechSTS.POS_CENTER)
         self._speed = self.DEFAULT_SPEED
         self._acceleration = self.DEFAULT_ACCELERATION
+        self._current_xyz = None
     
     def connect(self) -> bool:
+        print(f"[CONNECT] 尝试连接到 {self.bus.port} @ {self.bus.baudrate}")
         if not self.bus.connect():
+            print("[CONNECT] 串口连接失败")
             return False
         
+        print("[CONNECT] 串口连接成功, 开始配置舵机...")
         for i in range(6):
+            print(f"[CONNECT] 配置舵机 {i+1}/{6}: 启用扭矩, 设置速度={self._speed}, 加速度={self._acceleration}")
             self.bus.enable_torque(i + 1, True)
             self.bus.set_acceleration(i + 1, self._acceleration)
             self.bus.set_speed(i + 1, self._speed)
             time.sleep(0.03)
         
         self.connected = True
-        print("✓ 机械臂已连接")
+        print("[CONNECT] ✓ 机械臂已连接")
         return True
     
     def disconnect(self):
@@ -273,25 +289,240 @@ class SOARM101Controller:
     def get_joint_positions(self) -> np.ndarray:
         return self.current_positions.copy()
     
+    def forward_kinematics(self, angles: np.ndarray = None) -> Tuple[float, float, float]:
+        """
+        正运动学: 从关节角度计算末端位置 (基于SO101 URDF)
+        
+        坐标系定义:
+        - 原点: 基座底部中心
+        - X轴: 机械臂前方
+        - Y轴: 机械臂左方  
+        - Z轴: 垂直向上
+        
+        Args:
+            angles: 5个关节角度 (弧度), 不包括夹爪. 如果为None则使用当前位置
+            
+        Returns:
+            (x, y, z): 末端位置 (米)
+        """
+        if angles is None:
+            angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions[:5]])
+        
+        q1, q2, q3, q4, q5 = angles[:5]
+        
+        L = self.LINK_LENGTHS
+        
+        def rot_z(angle):
+            c, s = np.cos(angle), np.sin(angle)
+            return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        
+        def rot_y(angle):
+            c, s = np.cos(angle), np.sin(angle)
+            return np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]])
+        
+        def rot_x(angle):
+            c, s = np.cos(angle), np.sin(angle)
+            return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
+        
+        def trans(x, y, z):
+            return np.array([[1, 0, 0, x], [0, 1, 0, y], [0, 0, 1, z], [0, 0, 0, 1]])
+        
+        T_base_shoulder = trans(0.0388, 0, 0.0624) @ rot_z(q1)
+        
+        T_shoulder_upper = trans(-0.0304, -0.0183, -0.0542) @ rot_x(-np.pi/2) @ rot_y(-np.pi/2) @ rot_z(q2)
+        
+        T_upper_lower = trans(-0.11257, -0.028, 0) @ rot_z(np.pi/2) @ rot_z(q3)
+        
+        T_lower_wrist = trans(-0.1349, 0.0052, 0) @ rot_z(-np.pi/2) @ rot_z(q4)
+        
+        T_wrist_gripper = trans(0, -0.0611, 0.0181) @ rot_x(np.pi/2) @ rot_y(0.0487) @ rot_z(np.pi) @ rot_z(q5)
+        
+        T_gripper_ee = trans(-0.0079, 0, -0.0981)
+        
+        T = T_base_shoulder @ T_shoulder_upper @ T_upper_lower @ T_lower_wrist @ T_wrist_gripper @ T_gripper_ee
+        
+        x, y, z = T[0, 3], T[1, 3], T[2, 3]
+        
+        return np.array([x, y, z])
+    
+    def inverse_kinematics(self, target_xyz: np.ndarray, current_angles: np.ndarray = None) -> Optional[np.ndarray]:
+        """
+        逆运动学: 从目标位置计算关节角度 (数值解法)
+        
+        Args:
+            target_xyz: 目标位置 (x, y, z) 米
+            current_angles: 当前关节角度 (作为初始猜测)
+            
+        Returns:
+            关节角度 (5个) 或 None (无解)
+        """
+        if current_angles is None:
+            current_angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions[:5]])
+        
+        target = np.array(target_xyz)
+        angles = current_angles.copy()
+        
+        max_iterations = 100
+        learning_rate = 0.5
+        tolerance = 0.001
+        
+        for iteration in range(max_iterations):
+            current_pos = self.forward_kinematics(angles)
+            error = target - current_pos
+            distance = np.linalg.norm(error)
+            
+            if distance < tolerance:
+                print(f"[IK] 收敛于第 {iteration} 次迭代, 误差={distance*1000:.2f}mm")
+                return angles
+            
+            delta = 0.001
+            jacobian = np.zeros((3, 5))
+            
+            for j in range(5):
+                angles_plus = angles.copy()
+                angles_plus[j] += delta
+                pos_plus = self.forward_kinematics(angles_plus)
+                jacobian[:, j] = (pos_plus - current_pos) / delta
+            
+            try:
+                jacobian_pinv = np.linalg.pinv(jacobian)
+                delta_angles = jacobian_pinv @ error * learning_rate
+                angles += delta_angles
+                
+                for i in range(5):
+                    angles[i] = np.clip(angles[i], self.JOINT_LIMITS[i][0], self.JOINT_LIMITS[i][1])
+                    
+            except np.linalg.LinAlgError:
+                print("[IK] 雅可比矩阵奇异，无法求解")
+                return None
+        
+        final_error = np.linalg.norm(target - self.forward_kinematics(angles))
+        print(f"[IK] 未收敛, 最终误差={final_error*1000:.2f}mm")
+        return angles if final_error < 0.02 else None
+    
+    def get_current_xyz(self) -> np.ndarray:
+        """获取当前末端位置 (米)"""
+        angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions[:5]])
+        self._current_xyz = self.forward_kinematics(angles)
+        return self._current_xyz
+    
+    def move_to_xyz(self, target_xyz: List[float], duration: float = 1.5) -> bool:
+        """
+        移动到目标笛卡尔坐标
+        
+        Args:
+            target_xyz: 目标位置 (x, y, z) 米
+            duration: 运动时间
+            
+        Returns:
+            是否成功
+        """
+        if not self.connected:
+            print("[ERROR] move_to_xyz(): 机械臂未连接")
+            return False
+        
+        target = np.array(target_xyz)
+        print(f"[MOVE_XYZ] 目标位置: x={target[0]*1000:.1f}mm, y={target[1]*1000:.1f}mm, z={target[2]*1000:.1f}mm")
+        
+        current_angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions[:5]])
+        current_pos = self.forward_kinematics(current_angles)
+        print(f"[MOVE_XYZ] 当前位置: x={current_pos[0]*1000:.1f}mm, y={current_pos[1]*1000:.1f}mm, z={current_pos[2]*1000:.1f}mm")
+        
+        target_angles = self.inverse_kinematics(target, current_angles)
+        if target_angles is None:
+            print("[MOVE_XYZ] 无法到达目标位置")
+            return False
+        
+        full_angles = np.zeros(6)
+        full_angles[:5] = target_angles
+        full_angles[5] = FeetechSTS.position_to_angle(self.current_positions[5])
+        
+        result = self.move_to_angles(full_angles, duration)
+        if result:
+            self._current_xyz = target
+        return result
+    
+    def move_relative(self, dx: float = 0, dy: float = 0, dz: float = 0, duration: float = 1.0) -> bool:
+        """
+        相对移动 (笛卡尔空间)
+        
+        Args:
+            dx: X方向移动量 (米), 正方向为前方
+            dy: Y方向移动量 (米), 正方向为左方
+            dz: Z方向移动量 (米), 正方向为上方
+            duration: 运动时间
+            
+        Returns:
+            是否成功
+        """
+        if not self.connected:
+            print("[ERROR] move_relative(): 机械臂未连接")
+            return False
+        
+        current_pos = self.get_current_xyz()
+        target_pos = current_pos + np.array([dx, dy, dz])
+        
+        print(f"[MOVE_REL] 相对移动: dx={dx*1000:.1f}mm, dy={dy*1000:.1f}mm, dz={dz*1000:.1f}mm")
+        print(f"[MOVE_REL] 从 ({current_pos[0]*1000:.1f}, {current_pos[1]*1000:.1f}, {current_pos[2]*1000:.1f}) mm")
+        print(f"[MOVE_REL] 到 ({target_pos[0]*1000:.1f}, {target_pos[1]*1000:.1f}, {target_pos[2]*1000:.1f}) mm")
+        
+        return self.move_to_xyz(target_pos, duration)
+    
+    def move_up(self, distance: float = 0.05, duration: float = 1.0) -> bool:
+        """向上移动 (米)"""
+        return self.move_relative(dz=abs(distance), duration=duration)
+    
+    def move_down(self, distance: float = 0.05, duration: float = 1.0) -> bool:
+        """向下移动 (米)"""
+        return self.move_relative(dz=-abs(distance), duration=duration)
+    
+    def move_left(self, distance: float = 0.05, duration: float = 1.0) -> bool:
+        """向左移动 (米)"""
+        return self.move_relative(dy=abs(distance), duration=duration)
+    
+    def move_right(self, distance: float = 0.05, duration: float = 1.0) -> bool:
+        """向右移动 (米)"""
+        return self.move_relative(dy=-abs(distance), duration=duration)
+    
+    def move_forward(self, distance: float = 0.05, duration: float = 1.0) -> bool:
+        """向前移动 (米)"""
+        return self.move_relative(dx=abs(distance), duration=duration)
+    
+    def move_backward(self, distance: float = 0.05, duration: float = 1.0) -> bool:
+        """向后移动 (米)"""
+        return self.move_relative(dx=-abs(distance), duration=duration)
+    
     def move_to_angles(self, angles: List[float], duration: float = 1.0, 
                        blocking: bool = True) -> bool:
         if not self.connected:
+            print("[ERROR] move_to_angles(): 机械臂未连接")
             return False
         
         angles = np.array(angles, dtype=float)
+        print(f"[MOVE] 目标角度: {[f'{np.degrees(a):.1f}°' for a in angles]}")
+        
         for i in range(6):
+            original = angles[i]
             angles[i] = np.clip(angles[i], self.JOINT_LIMITS[i][0], self.JOINT_LIMITS[i][1])
+            if abs(original - angles[i]) > 0.01:
+                print(f"[MOVE] 关节{i+1}({self.JOINT_NAMES[i]}) 角度被限制: {np.degrees(original):.1f}° -> {np.degrees(angles[i]):.1f}°")
         
         target_positions = np.array([FeetechSTS.angle_to_position(a) for a in angles])
         start_positions = self.current_positions.copy()
         
+        print(f"[MOVE] 目标位置: {target_positions.tolist()}")
+        print(f"[MOVE] 起始位置: {start_positions.tolist()}")
+        print(f"[MOVE] duration={duration}s, blocking={blocking}")
+        
         if not blocking:
             self.bus.sync_write_positions(target_positions.tolist(), self._speed)
             self.current_positions = target_positions
+            print("[MOVE] 非阻塞模式: 命令已发送")
             return True
         
         num_steps = max(10, int(duration * 30))
         dt = duration / num_steps
+        print(f"[MOVE] 开始运动, 共{num_steps}步, 每步{dt*1000:.1f}ms")
         
         for step in range(num_steps + 1):
             t = step / num_steps
@@ -305,6 +536,7 @@ class SOARM101Controller:
             self.current_positions = current_pos.astype(int)
             time.sleep(dt)
         
+        print("[MOVE] 运动完成")
         return True
     
     def move_to_position(self, positions: List[int], duration: float = 1.0) -> bool:
@@ -336,39 +568,78 @@ class SOARM101Controller:
         return True
     
     def move_to_neutral(self, duration: float = 1.0) -> bool:
-        return self.move_to_angles([0, 0, 0, 0, 0, 0.87], duration)
+        print(f"[NEUTRAL] 移动到中立位置, duration={duration}s")
+        print("[NEUTRAL] 目标姿态: 所有关节0°, 夹爪微开")
+        result = self.move_to_angles([0, 0, 0, 0, 0, 0.0], duration)
+        print(f"[NEUTRAL] {'成功' if result else '失败'}")
+        return result
     
     def move_to_home(self, duration: float = 1.5) -> bool:
-        return self.move_to_angles([0, -1.5, 1.5, 0, 0, 0.87], duration)
+        print(f"[HOME] 移动到初始位置, duration={duration}s")
+        print("[HOME] 目标姿态: 肩部0°, 肩抬-86°, 肘部86°, 腕部0°, 腕旋0°, 夹爪打开")
+        result = self.move_to_angles([0, -1.5, 1.5, 0, 0, self.GRIPPER_OPEN_ANGLE], duration)
+        print(f"[HOME] {'成功' if result else '失败'}")
+        return result
     
     def grasp(self, duration: float = 0.5) -> bool:
-        angles = self.get_joint_angles()
-        if angles is None:
+        if not self.connected:
+            print("[ERROR] grasp(): 机械臂未连接")
             return False
-        angles[5] = -0.1
-        return self.move_to_angles(angles, duration)
+        
+        print(f"[GRASP] 开始闭合夹爪, duration={duration}s")
+        
+        angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions])
+        print(f"[GRASP] 当前角度: {[f'{np.degrees(a):.1f}°' for a in angles]}")
+        
+        angles[5] = self.GRIPPER_CLOSE_ANGLE
+        print(f"[GRASP] 目标夹爪角度: {np.degrees(angles[5]):.1f}°")
+        
+        result = self.move_to_angles(angles, duration)
+        print(f"[GRASP] 夹爪闭合 {'成功' if result else '失败'}")
+        return result
     
     def release(self, duration: float = 0.5) -> bool:
-        angles = self.get_joint_angles()
-        if angles is None:
+        if not self.connected:
+            print("[ERROR] release(): 机械臂未连接")
             return False
-        angles[5] = 1.5
-        return self.move_to_angles(angles, duration)
+        
+        print(f"[RELEASE] 开始打开夹爪, duration={duration}s")
+        
+        angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions])
+        print(f"[RELEASE] 当前角度: {[f'{np.degrees(a):.1f}°' for a in angles]}")
+        
+        angles[5] = self.GRIPPER_OPEN_ANGLE
+        print(f"[RELEASE] 目标夹爪角度: {np.degrees(angles[5]):.1f}°")
+        
+        result = self.move_to_angles(angles, duration)
+        print(f"[RELEASE] 夹爪打开 {'成功' if result else '失败'}")
+        return result
     
     def rotate_shoulder(self, angle_rad: float, duration: float = 1.0) -> bool:
-        angles = self.get_joint_angles()
-        if angles is None:
+        if not self.connected:
+            print("[ERROR] rotate_shoulder(): 机械臂未连接")
             return False
+        
+        print(f"[ROTATE] 肩部旋转, 目标角度={np.degrees(angle_rad):.1f}°, duration={duration}s")
+        
+        angles = np.array([FeetechSTS.position_to_angle(p) for p in self.current_positions])
+        print(f"[ROTATE] 当前肩部角度: {np.degrees(angles[0]):.1f}°")
+        
         angles[0] = np.clip(angle_rad, self.JOINT_LIMITS[0][0], self.JOINT_LIMITS[0][1])
-        return self.move_to_angles(angles, duration)
+        print(f"[ROTATE] 限制后目标角度: {np.degrees(angles[0]):.1f}° (限制: ±{np.degrees(self.JOINT_LIMITS[0][1]):.1f}°)")
+        
+        result = self.move_to_angles(angles, duration)
+        print(f"[ROTATE] 肩部旋转 {'成功' if result else '失败'}")
+        return result
     
     def wait(self, seconds: float):
         time.sleep(seconds)
     
     def scan_servos(self) -> dict:
         result = {}
-        print("\n扫描舵机...")
+        print("\n[SCAN] 扫描舵机...")
         for i in range(1, 7):
+            print(f"[SCAN] 检测舵机 ID={i}...", end=" ")
             if self.bus.ping(i):
                 pos = self.bus.read_position(i)
                 voltage = self.bus.read_voltage(i)
@@ -380,11 +651,15 @@ class SOARM101Controller:
                     'voltage': voltage,
                     'temperature': temp
                 }
-                status = f"位置={pos}" if pos else "位置读取失败"
-                print(f"  ✓ 舵机 ID={i}: {status}")
+                if pos:
+                    angle = FeetechSTS.position_to_angle(pos)
+                    print(f"✓ 在线, 位置={pos}, 角度={np.degrees(angle):.1f}°, 电压={voltage}V, 温度={temp}°C")
+                else:
+                    print(f"✓ 在线, 位置读取失败")
             else:
                 result[i] = {'online': False}
-                print(f"  ✗ 舵机 ID={i}: 无响应")
+                print(f"✗ 无响应")
+        print(f"[SCAN] 扫描完成, {sum(1 for r in result.values() if r.get('online'))}/6 舵机在线")
         return result
     
     def get_voltage(self) -> float:
@@ -557,33 +832,137 @@ class SOARM101TaskRunner:
             return False
     
     def run_simple_test(self):
-        """运行简单测试"""
+        """运行完整测试 - 测试所有运动控制命令"""
         if not self.arm.connected:
-            print("错误: 机械臂未连接")
+            print("[ERROR] 机械臂未连接")
             return
         
-        print("\n开始简单测试...")
+        print("\n" + "="*60)
+        print("开始完整测试 - 测试所有运动控制命令")
+        print("="*60)
         
-        print("\n1. 移动到中立位置")
-        self.arm.move_to_neutral(duration=1.5)
-        time.sleep(0.5)
+        try:
+            print("\n" + "-"*60)
+            print("[TEST 1/8] 移动到中立位置")
+            print("-"*60)
+            self.arm.move_to_neutral(duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[TEST 2/8] 肩部旋转测试 (向右 +28.6°)")
+            print("-"*60)
+            self.arm.rotate_shoulder(0.5, duration=1.0)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[TEST 3/8] 肩部旋转测试 (向左 -28.6°)")
+            print("-"*60)
+            self.arm.rotate_shoulder(-0.5, duration=1.0)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[TEST 4/8] 肩部旋转测试 (回到中心 0°)")
+            print("-"*60)
+            self.arm.rotate_shoulder(0.0, duration=1.0)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[TEST 5/8] 夹爪闭合测试")
+            print("-"*60)
+            self.arm.grasp(duration=0.8)
+            time.sleep(1)
+            
+            print("\n" + "-"*60)
+            print("[TEST 6/8] 夹爪打开测试")
+            print("-"*60)
+            self.arm.release(duration=0.8)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[TEST 7/8] 移动到初始位置 (Home)")
+            print("-"*60)
+            self.arm.move_to_home(duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[TEST 8/8] 返回中立位置")
+            print("-"*60)
+            self.arm.move_to_neutral(duration=1.5)
+            
+            print("\n" + "="*60)
+            print("✓ 所有测试完成!")
+            print("="*60)
+            
+        except KeyboardInterrupt:
+            print("\n[INTERRUPT] 用户中断测试")
+        except Exception as e:
+            print(f"\n[ERROR] 测试出错: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def run_cartesian_test(self):
+        """测试笛卡尔空间控制"""
+        if not self.arm.connected:
+            print("[ERROR] 机械臂未连接")
+            return
         
-        print("\n2. 肩部旋转测试")
-        self.arm.rotate_shoulder(0.5, duration=1.0)
-        time.sleep(0.5)
-        self.arm.rotate_shoulder(-0.5, duration=1.0)
-        time.sleep(0.5)
+        print("\n" + "="*60)
+        print("笛卡尔空间控制测试")
+        print("="*60)
         
-        print("\n3. 夹爪测试")
-        self.arm.grasp()
-        time.sleep(1)
-        self.arm.release()
-        time.sleep(0.5)
-        
-        print("\n4. 返回中立位置")
-        self.arm.move_to_neutral()
-        
-        print("\n✓ 测试完成!")
+        try:
+            print("\n" + "-"*60)
+            print("[CARTESIAN 1/7] 移动到中立位置")
+            print("-"*60)
+            self.arm.move_to_neutral(duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[CARTESIAN 2/7] 获取当前末端位置")
+            print("-"*60)
+            pos = self.arm.get_current_xyz()
+            print(f"当前末端位置: x={pos[0]*1000:.1f}mm, y={pos[1]*1000:.1f}mm, z={pos[2]*1000:.1f}mm")
+            time.sleep(0.3)
+            
+            print("\n" + "-"*60)
+            print("[CARTESIAN 3/7] 向上移动 5cm")
+            print("-"*60)
+            self.arm.move_up(0.05, duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[CARTESIAN 4/7] 向下移动 5cm (回到原高度)")
+            print("-"*60)
+            self.arm.move_down(0.05, duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[CARTESIAN 5/7] 向左移动 5cm")
+            print("-"*60)
+            self.arm.move_left(0.05, duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[CARTESIAN 6/7] 向右移动 5cm (回到原位置)")
+            print("-"*60)
+            self.arm.move_right(0.05, duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "-"*60)
+            print("[CARTESIAN 7/7] 返回中立位置")
+            print("-"*60)
+            self.arm.move_to_neutral(duration=1.5)
+            
+            print("\n" + "="*60)
+            print("✓ 笛卡尔空间控制测试完成!")
+            print("="*60)
+            
+        except KeyboardInterrupt:
+            print("\n[INTERRUPT] 用户中断测试")
+        except Exception as e:
+            print(f"\n[ERROR] 测试出错: {e}")
+            import traceback
+            traceback.print_exc()
     
     def __enter__(self):
         self.connect()
@@ -600,6 +979,7 @@ def main():
     parser = argparse.ArgumentParser(description='SO-ARM101 机械臂控制')
     parser.add_argument('port', nargs='?', default='COM18', help='串口端口')
     parser.add_argument('--test', action='store_true', help='运行简单测试')
+    parser.add_argument('--cartesian', action='store_true', help='运行笛卡尔空间控制测试')
     parser.add_argument('--task', action='store_true', help='运行完整抓取任务')
     parser.add_argument('--rotate', type=float, default=90, help='旋转角度（度）')
     parser.add_argument('--wait', type=float, default=5, help='等待时间（秒）')
@@ -622,12 +1002,15 @@ def main():
         if args.task:
             rotate_rad = np.radians(args.rotate)
             runner.run_grasp_rotate_place(rotate_angle=rotate_rad, wait_time=args.wait)
+        elif args.cartesian:
+            runner.run_cartesian_test()
         elif args.test:
             runner.run_simple_test()
         else:
             print("\n使用方法:")
-            print("  python soarm101_sdk.py COM18 --test     # 简单测试")
-            print("  python soarm101_sdk.py COM18 --task     # 完整抓取任务")
+            print("  python soarm101_sdk.py COM18 --test        # 关节空间测试")
+            print("  python soarm101_sdk.py COM18 --cartesian   # 笛卡尔空间测试")
+            print("  python soarm101_sdk.py COM18 --task        # 完整抓取任务")
             print("  python soarm101_sdk.py COM18 --task --rotate 90 --wait 5")
         
         runner.disconnect()
