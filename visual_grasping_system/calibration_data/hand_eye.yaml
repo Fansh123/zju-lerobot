@@ -1,0 +1,23 @@
+# 手眼标定配置文件
+# 需要通过标定程序生成实际值
+
+# 旋转矩阵 (3x3)
+rotation:
+  - [1.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0]
+  - [0.0, 0.0, 1.0]
+
+# 平移向量 (3x1)
+translation:
+  - [0.0]
+  - [0.0]
+  - [0.05]
+
+# 是否已标定
+calibrated: false
+
+# 标定时间
+calibration_date: null
+
+# 标定误差
+reprojection_error: null
