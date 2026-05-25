@@ -59,7 +59,7 @@ def main():
         print("\n" + "="*60)
         print("步骤4: 竖直下降到物块位置 (200mm, 0mm, 0mm)")
         print("="*60)
-        arm.move_to_xyz([0.200, 0.0, 0.000], duration=2.0)
+        arm.move_to_xyz([0.200, 0.1, 0.100], duration=2.0)
         time.sleep(0.5)
         
         pos = arm.get_current_xyz()
