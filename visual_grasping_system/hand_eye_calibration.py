@@ -10,7 +10,7 @@ import yaml
 from typing import Optional, List, Tuple, Dict
 
 from wrist_camera import WristCamera
-from soarm101_sdk import SOARM101Controller
+from soarm101_sdk_urdf import SOARM101Controller
 
 
 class HandEyeCalibration:
@@ -22,7 +22,7 @@ class HandEyeCalibration:
         self.camera = camera
         self.calibration_dir = calibration_dir
         
-        self.chessboard_size = (9, 6)
+        self.chessboard_size = (8, 5)
         self.square_size = 25
         
         self.calibration_data = {
@@ -59,6 +59,8 @@ class HandEyeCalibration:
         images_captured = 0
         
         print("按 'c' 捕获图像，按 'q' 完成标定")
+        print("\n⚠️  请点击弹出的摄像头窗口，然后按键操作！")
+        print("⚠️  必须检测到棋盘格（显示彩色角点）才能按 'c' 拍照！\n")
         
         while images_captured < num_images:
             frame = self.camera.get_frame()
@@ -72,22 +74,33 @@ class HandEyeCalibration:
             
             if ret:
                 self.camera.cv2.drawChessboardCorners(display, self.chessboard_size, corners, ret)
+                status = "CHESSBOARD DETECTED - Press 'c' now!"
+                status_color = (0, 255, 0)
+            else:
+                status = "NO CHESSBOARD - Move the board into view"
+                status_color = (0, 0, 255)
             
-            self.camera.cv2.putText(display, f"已采集: {images_captured}/{num_images}", 
+            self.camera.cv2.putText(display, f"Captured: {images_captured}/{num_images}", 
                                     (10, 30), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 
                                     1, (0, 255, 0), 2)
+            self.camera.cv2.putText(display, status, 
+                                    (10, 70), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.8, status_color, 2)
             
             self.camera.cv2.imshow("Camera Calibration", display)
             
-            key = self.camera.cv2.waitKey(1) & 0xFF
+            key = self.camera.cv2.waitKey(50) & 0xFF
             
             if key == ord('q'):
                 break
-            elif key == ord('c') and ret:
-                obj_points.append(objp)
-                img_points.append(corners)
-                images_captured += 1
-                print(f"  采集图像 {images_captured}/{num_images}")
+            elif key == ord('c'):
+                if ret:
+                    obj_points.append(objp)
+                    img_points.append(corners)
+                    images_captured += 1
+                    print(f"  ✓ 采集图像 {images_captured}/{num_images}")
+                else:
+                    print("  ✗ 未检测到棋盘格，请调整标定板位置！")
         
         self.camera.cv2.destroyWindow("Camera Calibration")
         
@@ -141,8 +154,13 @@ class HandEyeCalibration:
         base_angles = [0, 0, 0, 0, 0, 0.87]
         
         print("按 'c' 捕获当前姿态，按 'q' 完成标定")
+        print("按 'd' 断开扭矩（可手动拖动机械臂），按 'r' 恢复扭矩")
+        print("按 'm' 自动移动机械臂")
+        print("\n⚠️  请点击弹出的摄像头窗口，然后按键操作！")
+        print("⚠️  必须检测到棋盘格（显示彩色角点）才能按 'c' 拍照！\n")
         
         poses_captured = 0
+        torque_enabled = True
         
         while poses_captured < num_poses:
             frame = self.camera.get_frame()
@@ -156,39 +174,81 @@ class HandEyeCalibration:
             
             if ret:
                 self.camera.cv2.drawChessboardCorners(display, self.chessboard_size, corners, ret)
+                status = "CHESSBOARD DETECTED - Press 'c' now!"
+                status_color = (0, 255, 0)
+            else:
+                status = "NO CHESSBOARD - Adjust arm position"
+                status_color = (0, 0, 255)
             
-            self.camera.cv2.putText(display, f"已采集: {poses_captured}/{num_poses}", 
+            torque_status = "TORQUE: ON" if torque_enabled else "TORQUE: OFF (can drag arm)"
+            torque_color = (0, 255, 0) if torque_enabled else (0, 165, 255)
+            
+            self.camera.cv2.putText(display, f"Poses: {poses_captured}/{num_poses}", 
                                     (10, 30), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 
                                     1, (0, 255, 0), 2)
+            self.camera.cv2.putText(display, status, 
+                                    (10, 70), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.7, status_color, 2)
+            self.camera.cv2.putText(display, torque_status, 
+                                    (10, 100), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.7, torque_color, 2)
+            self.camera.cv2.putText(display, "Keys: c=capture, d=disable torque, r=enable torque, m=auto move, q=quit", 
+                                    (10, 130), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.5, (255, 255, 0), 2)
             
             self.camera.cv2.imshow("Hand-Eye Calibration", display)
             
-            key = self.camera.cv2.waitKey(1) & 0xFF
+            key = self.camera.cv2.waitKey(50) & 0xFF
             
             if key == ord('q'):
                 break
-            elif key == ord('c') and ret:
-                joint_angles = self.arm.get_joint_angles()
-                
-                R_ee, t_ee = self._forward_kinematics(joint_angles)
-                R_gripper2base.append(R_ee)
-                t_gripper2base.append(t_ee)
-                
-                _, rvec, tvec = self.camera.cv2.solvePnP(
-                    self._get_object_points(), 
-                    corners,
-                    self.calibration_data['camera_matrix'],
-                    self.calibration_data['dist_coeffs']
-                )
-                
-                R, _ = self.camera.cv2.Rodrigues(rvec)
-                R_target2cam.append(R)
-                t_target2cam.append(tvec)
-                
-                poses_captured += 1
-                print(f"  采集姿态 {poses_captured}/{num_poses}")
-                
+            elif key == ord('d'):
+                for i in range(6):
+                    self.arm.bus.enable_torque(i + 1, False)
+                torque_enabled = False
+                print("  ⚠️ 扭矩已断开，现在可以手动拖动机械臂！")
+            elif key == ord('r'):
+                for i in range(6):
+                    self.arm.bus.enable_torque(i + 1, True)
+                torque_enabled = True
+                print("  ✓ 扭矩已恢复")
+            elif key == ord('m'):
+                if not torque_enabled:
+                    for i in range(6):
+                        self.arm.bus.enable_torque(i + 1, True)
+                    torque_enabled = True
+                print("  移动机械臂到新位置...")
                 self._move_to_random_pose()
+            elif key == ord('c'):
+                if ret:
+                    if not torque_enabled:
+                        for i in range(6):
+                            self.arm.bus.enable_torque(i + 1, True)
+                        torque_enabled = True
+                        print("  ✓ 扭矩已恢复")
+                    
+                    joint_angles = self.arm.get_joint_angles()
+                    
+                    R_ee, t_ee = self._forward_kinematics(joint_angles)
+                    R_gripper2base.append(R_ee)
+                    t_gripper2base.append(t_ee)
+                    
+                    _, rvec, tvec = self.camera.cv2.solvePnP(
+                        self._get_object_points(), 
+                        corners,
+                        self.calibration_data['camera_matrix'],
+                        self.calibration_data['dist_coeffs']
+                    )
+                    
+                    R, _ = self.camera.cv2.Rodrigues(rvec)
+                    R_target2cam.append(R)
+                    t_target2cam.append(tvec)
+                    
+                    poses_captured += 1
+                    print(f"  ✓ 采集姿态 {poses_captured}/{num_poses}")
+                    print("  按 'd' 断开扭矩手动调整，或按 'm' 自动移动...")
+                else:
+                    print("  ✗ 未检测到棋盘格，请调整机械臂位置！")
         
         self.camera.cv2.destroyWindow("Hand-Eye Calibration")
         
@@ -223,22 +283,16 @@ class HandEyeCalibration:
         return True
     
     def _forward_kinematics(self, joint_angles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        R = np.eye(3)
-        t = np.array([0, 0, 0.1])
+        if self.arm.urdf is None:
+            print("[ERROR] URDF未加载，无法计算正运动学")
+            return np.eye(3), np.zeros(3)
         
-        link_lengths = [0, 0.1, 0.1, 0.08, 0.05, 0.03]
+        position, rotation = self.arm.forward_kinematics(joint_angles[:5])
         
-        for i, angle in enumerate(joint_angles[:5]):
-            c, s = np.cos(angle), np.sin(angle)
-            if i == 0:
-                R_i = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-            else:
-                R_i = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
-            
-            R = R @ R_i
-            t = t + R @ np.array([0, 0, link_lengths[i]])
+        if position is None or rotation is None:
+            return np.eye(3), np.zeros(3)
         
-        return R, t
+        return rotation, position
     
     def _get_object_points(self) -> np.ndarray:
         objp = np.zeros((self.chessboard_size[0] * self.chessboard_size[1], 3), np.float32)
@@ -251,17 +305,17 @@ class HandEyeCalibration:
         if angles is None:
             return
         
-        delta = np.random.uniform(-0.2, 0.2, 5)
+        delta = np.random.uniform(-0.1, 0.1, 5)
         new_angles = angles.copy()
         new_angles[:5] += delta
         
-        new_angles[0] = np.clip(new_angles[0], -1.5, 1.5)
-        new_angles[1] = np.clip(new_angles[1], -1.0, 1.0)
-        new_angles[2] = np.clip(new_angles[2], -1.0, 1.0)
-        new_angles[3] = np.clip(new_angles[3], -1.0, 1.0)
-        new_angles[4] = np.clip(new_angles[4], -1.5, 1.5)
+        new_angles[0] = np.clip(new_angles[0], -0.5, 0.5)
+        new_angles[1] = np.clip(new_angles[1], -0.3, 0.8)
+        new_angles[2] = np.clip(new_angles[2], -1.2, -0.2)
+        new_angles[3] = np.clip(new_angles[3], -0.5, 1.0)
+        new_angles[4] = np.clip(new_angles[4], -1.0, 1.0)
         
-        self.arm.move_to_angles(new_angles, duration=1.0)
+        self.arm.set_joint_angles(new_angles, duration=1.0)
         time.sleep(0.5)
     
     def _save_camera_calibration(self):
@@ -333,15 +387,26 @@ class HandEyeCalibration:
 
 
 def main():
-    import sys
-    port = sys.argv[1] if len(sys.argv) > 1 else 'COM18'
+    import argparse
+    import os
+    
+    parser = argparse.ArgumentParser(description='手眼标定工具')
+    parser.add_argument('port', nargs='?', default='COM18', help='串口端口')
+    parser.add_argument('--camera', type=int, default=0, help='摄像头ID (默认0)')
+    
+    args = parser.parse_args()
+    
+    urdf_path = os.path.join(os.path.dirname(__file__), '..', 'SO-ARM100', 'Simulation', 'SO101', 'so101_new_calib.urdf')
+    if not os.path.exists(urdf_path):
+        urdf_path = None
+        print("[WARN] 未找到URDF文件，正运动学将不可用")
     
     print("="*60)
     print("手眼标定工具")
     print("="*60)
     
-    arm = SOARM101Controller(port)
-    camera = WristCamera(camera_id=0)
+    arm = SOARM101Controller(args.port, urdf_path=urdf_path)
+    camera = WristCamera(camera_id=args.camera)
     
     if not arm.connect():
         print("无法连接机械臂")

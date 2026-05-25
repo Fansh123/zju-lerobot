@@ -7,9 +7,10 @@
 import numpy as np
 import time
 import argparse
+import os
 from typing import Optional, Dict, List, Tuple
 
-from soarm101_sdk import SOARM101Controller
+from soarm101_sdk_urdf import SOARM101Controller
 from wrist_camera import WristCamera
 from object_detector import ObjectDetector
 from grasping_strategy import GraspingStrategy, GraspExecutor
@@ -25,7 +26,12 @@ class VisualGrasping:
         self.camera_id = camera_id
         self.calibration_file = calibration_file
         
-        self.arm = SOARM101Controller(arm_port)
+        urdf_path = os.path.join(os.path.dirname(__file__), '..', 'SO-ARM100', 'Simulation', 'SO101', 'so101_new_calib.urdf')
+        if not os.path.exists(urdf_path):
+            urdf_path = None
+            print("[WARN] 未找到URDF文件")
+        
+        self.arm = SOARM101Controller(arm_port, urdf_path=urdf_path)
         self.camera = WristCamera(camera_id)
         self.detector = ObjectDetector(self.camera)
         self.grasp_executor = None

@@ -7,15 +7,19 @@ import numpy as np
 import time
 from typing import Optional, Dict, Tuple
 from wrist_camera import WristCamera
-from soarm101_sdk import SOARM101Controller
+from soarm101_sdk_urdf import SOARM101Controller
+from coordinate_transformer import CoordinateTransformer
 
 
 class PlacingStrategy:
     """放置策略类"""
     
-    def __init__(self, arm: SOARM101Controller, camera: WristCamera = None, camera_id: int = 0):
+    def __init__(self, arm: SOARM101Controller, camera: WristCamera = None, camera_id: int = 0,
+                 calibration_dir: str = 'calibration_data'):
         self.arm = arm
         self.camera = camera if camera else WristCamera(camera_id)
+        self.transformer = CoordinateTransformer(calibration_dir)
+        self.default_depth = 0.25
         
         self.frame_size_mm = (100, 100)
         self.place_height = 0.02
@@ -48,12 +52,23 @@ class PlacingStrategy:
             'valid': self._validate_place_area(frame_obj)
         }
     
-    def _image_to_3d(self, image_pos: Tuple[int, int], depth: float = 0.2) -> Tuple[float, float]:
-        cx, cy = image_pos
+    def _image_to_3d(self, image_pos: Tuple[int, int], depth: float = None) -> Optional[Tuple[float, float]]:
+        if depth is None:
+            depth = self.default_depth
         
+        if self.transformer.is_calibrated():
+            ee_pos, ee_rot = self.arm.forward_kinematics()
+            if ee_pos is not None and ee_rot is not None:
+                point_base = self.transformer.image_to_base(
+                    image_pos, depth, ee_pos, ee_rot
+                )
+                if point_base is not None:
+                    print(f"[坐标转换] 图像{image_pos} -> 基座({point_base[0]*1000:.1f}, {point_base[1]*1000:.1f}, {point_base[2]*1000:.1f})mm")
+                    return (point_base[0], point_base[1])
+        
+        cx, cy = image_pos
         x = (cx - 320) * 0.001 * depth
         y = (cy - 240) * 0.001 * depth
-        
         return (x + 0.2, y)
     
     def _validate_place_area(self, frame_obj: Dict) -> bool:
@@ -140,7 +155,7 @@ class PlacingStrategy:
         angles[1] = np.clip(shoulder_lift, -1.75, 1.75)
         angles[2] = np.clip(elbow_flex, -1.69, 1.69)
         
-        self.arm.move_to_angles(angles, duration=1.5)
+        self.arm.set_joint_angles(angles, duration=1.5)
     
     def _fine_adjust(self, place_area: Dict):
         current_frame = self.camera.get_frame()
@@ -162,7 +177,7 @@ class PlacingStrategy:
             if angles is not None:
                 angles[0] += dx * 0.001
                 angles[1] += dy * 0.001
-                self.arm.move_to_angles(angles, duration=0.5)
+                self.arm.set_joint_angles(angles, duration=0.5)
     
     def _move_to_place_height(self, target_pos: Tuple[float, float], height: float):
         angles = self.arm.get_joint_angles()
@@ -172,13 +187,13 @@ class PlacingStrategy:
         angles[1] = angles[1] - 0.15
         angles[2] = angles[2] + 0.2
         
-        self.arm.move_to_angles(angles, duration=1.0)
+        self.arm.set_joint_angles(angles, duration=1.0)
     
     def _release_object(self):
         angles = self.arm.get_joint_angles()
         if angles is not None:
             angles[5] = self.gripper_open
-            self.arm.move_to_angles(angles, duration=0.5)
+            self.arm.set_joint_angles(angles, duration=0.5)
     
     def _lift_and_leave(self):
         angles = self.arm.get_joint_angles()
@@ -188,7 +203,7 @@ class PlacingStrategy:
         angles[1] = angles[1] + 0.2
         angles[2] = angles[2] - 0.1
         
-        self.arm.move_to_angles(angles, duration=1.0)
+        self.arm.set_joint_angles(angles, duration=1.0)
     
     def verify_placement(self, frame: np.ndarray = None) -> bool:
         if frame is None:

@@ -6,7 +6,8 @@
 import numpy as np
 import time
 from typing import Optional, Dict, Tuple
-from soarm101_sdk import SOARM101Controller
+from soarm101_sdk_urdf import SOARM101Controller
+from coordinate_transformer import CoordinateTransformer
 
 
 class GraspingStrategy:
@@ -72,7 +73,7 @@ class GraspingStrategy:
                 angles[3] = 1.2
                 angles[4] = np.radians(orientation)
                 angles[5] = self.gripper_open
-                self.arm.move_to_angles(angles, duration=1.0)
+                self.arm.set_joint_angles(angles, duration=1.0)
             time.sleep(0.5)
             
             print("3. 下降到抓取高度...")
@@ -83,7 +84,7 @@ class GraspingStrategy:
             angles = self.arm.get_joint_angles()
             if angles is not None:
                 angles[5] = self.gripper_close_horizontal
-                self.arm.move_to_angles(angles, duration=0.5)
+                self.arm.set_joint_angles(angles, duration=0.5)
             time.sleep(0.5)
             
             print("5. 提升物体...")
@@ -111,7 +112,7 @@ class GraspingStrategy:
                 angles[3] = 0
                 angles[4] = 0
                 angles[5] = self.gripper_open
-                self.arm.move_to_angles(angles, duration=1.0)
+                self.arm.set_joint_angles(angles, duration=1.0)
             time.sleep(0.5)
             
             print("3. 下降到抓取高度...")
@@ -122,7 +123,7 @@ class GraspingStrategy:
             angles = self.arm.get_joint_angles()
             if angles is not None:
                 angles[5] = self.gripper_close_vertical
-                self.arm.move_to_angles(angles, duration=0.5)
+                self.arm.set_joint_angles(angles, duration=0.5)
             time.sleep(0.5)
             
             print("5. 提升物体...")
@@ -154,7 +155,7 @@ class GraspingStrategy:
         angles[1] = np.clip(shoulder_lift, -1.75, 1.75)
         angles[2] = np.clip(elbow_flex, -1.69, 1.69)
         
-        self.arm.move_to_angles(angles, duration=1.5)
+        self.arm.set_joint_angles(angles, duration=1.5)
     
     def _move_to_grasp_height(self, target_pos: Tuple[float, float], height: float):
         angles = self.arm.get_joint_angles()
@@ -164,7 +165,7 @@ class GraspingStrategy:
         angles[1] = angles[1] - 0.2
         angles[2] = angles[2] + 0.3
         
-        self.arm.move_to_angles(angles, duration=1.0)
+        self.arm.set_joint_angles(angles, duration=1.0)
     
     def _lift_object(self, height: float):
         angles = self.arm.get_joint_angles()
@@ -174,7 +175,7 @@ class GraspingStrategy:
         angles[1] = angles[1] + 0.3
         angles[2] = angles[2] - 0.2
         
-        self.arm.move_to_angles(angles, duration=1.0)
+        self.arm.set_joint_angles(angles, duration=1.0)
     
     def release_object(self) -> bool:
         if not self.arm.connected:
@@ -184,7 +185,7 @@ class GraspingStrategy:
         angles = self.arm.get_joint_angles()
         if angles is not None:
             angles[5] = self.gripper_open
-            self.arm.move_to_angles(angles, duration=0.5)
+            self.arm.set_joint_angles(angles, duration=0.5)
         
         return True
     
@@ -217,9 +218,11 @@ class GraspingStrategy:
 class GraspExecutor:
     """抓取执行器 - 提供更高级的抓取控制"""
     
-    def __init__(self, arm: SOARM101Controller):
+    def __init__(self, arm: SOARM101Controller, calibration_dir: str = 'calibration_data'):
         self.strategy = GraspingStrategy(arm)
         self.arm = arm
+        self.transformer = CoordinateTransformer(calibration_dir)
+        self.default_depth = 0.25
     
     def auto_grasp(self, obj_info: Dict) -> bool:
         if not obj_info:
@@ -232,14 +235,29 @@ class GraspExecutor:
         
         target_3d = self._image_to_3d(position)
         
+        if target_3d is None:
+            print("错误: 无法计算目标位置")
+            return False
+        
         return self.strategy.execute_grasp(target_3d, grasp_type, orientation)
     
-    def _image_to_3d(self, image_pos: Tuple[int, int], depth: float = 0.2) -> Tuple[float, float]:
-        cx, cy = image_pos
+    def _image_to_3d(self, image_pos: Tuple[int, int], depth: float = None) -> Optional[Tuple[float, float]]:
+        if depth is None:
+            depth = self.default_depth
         
+        if self.transformer.is_calibrated():
+            ee_pos, ee_rot = self.arm.forward_kinematics()
+            if ee_pos is not None and ee_rot is not None:
+                point_base = self.transformer.image_to_base(
+                    image_pos, depth, ee_pos, ee_rot
+                )
+                if point_base is not None:
+                    print(f"[坐标转换] 图像{image_pos} -> 基座({point_base[0]*1000:.1f}, {point_base[1]*1000:.1f}, {point_base[2]*1000:.1f})mm")
+                    return (point_base[0], point_base[1])
+        
+        cx, cy = image_pos
         x = (cx - 320) * 0.001 * depth
         y = (cy - 240) * 0.001 * depth
-        
         return (x + 0.2, y)
     
     def test_grasp_horizontal(self):
