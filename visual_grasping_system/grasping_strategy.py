@@ -1,296 +1,285 @@
 """
-抓取策略模块
-提供横向抓取和纵向抓取两种策略
+视觉伺服抓取策略
+摄像头旋转90度，用Y偏差控制第一舵机
 """
 
 import numpy as np
 import time
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from soarm101_sdk_urdf import SOARM101Controller
-from coordinate_transformer import CoordinateTransformer
+from wrist_camera import WristCamera
 
 
-class GraspingStrategy:
-    """抓取策略类"""
+class VisualServoGrasp:
+    """视觉伺服抓取类"""
     
-    GRASP_HORIZONTAL = 'horizontal'
-    GRASP_VERTICAL = 'vertical'
+    CENTER_THRESHOLD_Y = 20
     
-    HORIZONTAL_APPROACH = {
-        'shoulder_pan': 0,
-        'shoulder_lift': 0.3,
-        'elbow_flex': -0.5,
-        'wrist_flex': 1.2,
-        'wrist_roll': 0,
-        'gripper': 1.5
-    }
+    MAX_ITERATIONS = 50
+    JOINT_STEP = 0.02
     
-    VERTICAL_APPROACH = {
-        'shoulder_pan': 0,
-        'shoulder_lift': 0.5,
-        'elbow_flex': -0.8,
-        'wrist_flex': 0,
-        'wrist_roll': 0,
-        'gripper': 1.5
-    }
+    GRASP_Z = 0.010
+    FORWARD_DISTANCE = 0.100
     
-    def __init__(self, arm: SOARM101Controller):
+    GRIPPER_OPEN = 1.1
+    GRIPPER_CLOSE = -1.0
+    WRIST_ROLL_ANGLE = -np.pi / 2
+    
+    CENTER_ADJUST_ANGLE = -0.087
+    
+    def __init__(self, arm: SOARM101Controller, camera: WristCamera):
         self.arm = arm
+        self.camera = camera
         
-        self.approach_height = 0.08
-        self.grasp_height = 0.02
-        self.lift_height = 0.15
-        
-        self.gripper_open = 1.5
-        self.gripper_close_horizontal = 0.2
-        self.gripper_close_vertical = 0.3
+        self.image_center_y = 240
     
-    def execute_grasp(self, target_pos: Tuple[float, float], grasp_type: str = 'vertical',
-                      orientation: float = 0) -> bool:
+    def visual_servo_center(self, show_display: bool = True) -> bool:
+        """
+        视觉伺服居中：用Y偏差控制第一舵机
+        摄像头旋转90度，物块应在画面上下中心线(Y=240)
+        
+        Args:
+            show_display: 是否显示摄像头画面
+            
+        Returns:
+            是否成功居中
+        """
+        print("\n[视觉伺服] 开始左右调整...")
+        
+        if show_display:
+            window_name = "Visual Servo - Press 'q' to stop"
+            self.camera.cv2.namedWindow(window_name)
+        
+        try:
+            for i in range(self.MAX_ITERATIONS):
+                frame = self.camera.get_frame()
+                if frame is None:
+                    continue
+                
+                display = frame.copy()
+                
+                self.camera.cv2.line(display, (0, self.image_center_y), (640, self.image_center_y), (0, 0, 255), 2)
+                
+                cube = self.camera.detect_red_cube(frame)
+                
+                if cube is None:
+                    print(f"  [{i+1}] 未检测到物块")
+                    
+                    self.camera.cv2.putText(display, "No cube detected", (10, 30),
+                                           self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                else:
+                    cx, cy = cube['center']
+                    error_y = cy - self.image_center_y
+                    
+                    self.camera.cv2.circle(display, (cx, cy), 10, (0, 255, 0), 2)
+                    self.camera.cv2.circle(display, (cx, cy), 3, (0, 255, 0), -1)
+                    
+                    if abs(error_y) < self.CENTER_THRESHOLD_Y:
+                        color = (0, 255, 0)
+                        status = f"CENTERED! Y error: {error_y}px"
+                        print(f"[视觉伺服] ✓ 居中成功！偏差={error_y}px")
+                        
+                        self.camera.cv2.putText(display, status, (10, 30),
+                                               self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        
+                        if show_display:
+                            self.camera.cv2.imshow(window_name, display)
+                            self.camera.cv2.waitKey(300)
+                        
+                        return True
+                    else:
+                        color = (0, 165, 255)
+                        if error_y < 0:
+                            direction = "UP -> Turn RIGHT"
+                        else:
+                            direction = "DOWN -> Turn LEFT"
+                        status = f"Y error: {error_y}px ({direction})"
+                    
+                    self.camera.cv2.putText(display, status, (10, 30),
+                                           self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    self.camera.cv2.putText(display, f"Center: ({cx}, {cy})", (10, 60),
+                                           self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    print(f"  [{i+1}] Y偏差: {error_y:.0f}px ({direction})")
+                    
+                    angles = self.arm.get_joint_angles()
+                    if angles is not None:
+                        if error_y < 0:
+                            angles[0] += self.JOINT_STEP
+                        else:
+                            angles[0] -= self.JOINT_STEP
+                        
+                        angles[0] = np.clip(angles[0], -1.5, 1.5)
+                        self.arm.set_joint_angles(angles, duration=0.2)
+                
+                if show_display:
+                    self.camera.cv2.imshow(window_name, display)
+                    key = self.camera.cv2.waitKey(50) & 0xFF
+                    if key == ord('q'):
+                        break
+                
+                time.sleep(0.1)
+            
+            print(f"[视觉伺服] ✗ 居中超时")
+            return False
+            
+        finally:
+            if show_display:
+                self.camera.cv2.destroyWindow(window_name)
+    
+    def execute_grasp(self, show_display: bool = True) -> bool:
+        """
+        执行视觉伺服抓取
+        
+        Args:
+            show_display: 是否显示摄像头画面
+            
+        Returns:
+            是否成功
+        """
         if not self.arm.connected:
             print("错误: 机械臂未连接")
             return False
         
-        print(f"\n执行{grasp_type}抓取...")
-        print(f"目标位置: {target_pos}, 方向: {orientation:.1f}°")
+        if self.arm.urdf is None:
+            print("错误: URDF未加载")
+            return False
         
-        if grasp_type == self.GRASP_HORIZONTAL:
-            return self._horizontal_grasp(target_pos, orientation)
-        else:
-            return self._vertical_grasp(target_pos, orientation)
-    
-    def _horizontal_grasp(self, target_pos: Tuple[float, float], orientation: float) -> bool:
-        print("\n[横向抓取流程]")
+        print("\n" + "="*60)
+        print("视觉伺服抓取流程")
+        print("="*60)
         
         try:
-            print("1. 移动到物体上方...")
-            self._move_above_target(target_pos, self.approach_height)
-            time.sleep(0.5)
-            
-            print("2. 调整腕部角度（横向）...")
+            print("\n[步骤1] 打开夹爪...")
             angles = self.arm.get_joint_angles()
             if angles is not None:
-                angles[3] = 1.2
-                angles[4] = np.radians(orientation)
-                angles[5] = self.gripper_open
-                self.arm.set_joint_angles(angles, duration=1.0)
-            time.sleep(0.5)
-            
-            print("3. 下降到抓取高度...")
-            self._move_to_grasp_height(target_pos, self.grasp_height)
-            time.sleep(0.5)
-            
-            print("4. 闭合夹爪...")
-            angles = self.arm.get_joint_angles()
-            if angles is not None:
-                angles[5] = self.gripper_close_horizontal
+                angles[5] = self.GRIPPER_OPEN
                 self.arm.set_joint_angles(angles, duration=0.5)
+            time.sleep(0.3)
+            
+            print("\n[步骤2] 设置横向抓取姿态...")
+            angles = self.arm.get_joint_angles()
+            if angles is not None:
+                angles[4] = self.WRIST_ROLL_ANGLE
+                self.arm.set_joint_angles(angles, duration=0.8)
             time.sleep(0.5)
             
-            print("5. 提升物体...")
-            self._lift_object(self.lift_height)
+            print("\n[步骤3] 视觉伺服居中...")
+            if not self.visual_servo_center(show_display):
+                print("居中失败，尝试继续...")
+            
+            print("\n[步骤3.5] 向左微调5度...")
+            angles = self.arm.get_joint_angles()
+            if angles is not None:
+                angles[0] += self.CENTER_ADJUST_ANGLE
+                angles[0] = np.clip(angles[0], -1.5, 1.5)
+                self.arm.set_joint_angles(angles, duration=0.5)
+            time.sleep(0.3)
+            
+            print("\n[步骤4] Z下降到10mm...")
+            current_pos = self.arm.get_current_xyz()
+            if current_pos is not None:
+                self.arm.move_to_xyz([current_pos[0], current_pos[1], self.GRASP_Z], duration=1.5)
             time.sleep(0.5)
             
-            print("✓ 横向抓取完成")
+            print("\n[步骤5] 向前移动100mm...")
+            current_pos = self.arm.get_current_xyz()
+            if current_pos is not None:
+                target_x = current_pos[0] + self.FORWARD_DISTANCE
+                target_y = current_pos[1]
+                target_z = self.GRASP_Z
+                self.arm.move_to_xyz([target_x, target_y, target_z], duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n[步骤6] 闭合夹爪...")
+            angles = self.arm.get_joint_angles()
+            if angles is not None:
+                angles[5] = self.GRIPPER_CLOSE
+                self.arm.set_joint_angles(angles, duration=0.8)
+            time.sleep(0.5)
+            
+            print("\n[步骤7] 提升物体...")
+            self.arm.move_relative(dz=0.1, duration=1.5)
+            time.sleep(0.5)
+            
+            print("\n" + "="*60)
+            print("✓ 视觉伺服抓取完成！")
+            print("="*60)
             return True
             
         except Exception as e:
-            print(f"抓取失败: {e}")
+            print(f"\n抓取失败: {e}")
             return False
-    
-    def _vertical_grasp(self, target_pos: Tuple[float, float], orientation: float) -> bool:
-        print("\n[纵向抓取流程]")
-        
-        try:
-            print("1. 移动到物体上方...")
-            self._move_above_target(target_pos, self.approach_height)
-            time.sleep(0.5)
-            
-            print("2. 调整腕部角度（纵向）...")
-            angles = self.arm.get_joint_angles()
-            if angles is not None:
-                angles[3] = 0
-                angles[4] = 0
-                angles[5] = self.gripper_open
-                self.arm.set_joint_angles(angles, duration=1.0)
-            time.sleep(0.5)
-            
-            print("3. 下降到抓取高度...")
-            self._move_to_grasp_height(target_pos, self.grasp_height)
-            time.sleep(0.5)
-            
-            print("4. 闭合夹爪...")
-            angles = self.arm.get_joint_angles()
-            if angles is not None:
-                angles[5] = self.gripper_close_vertical
-                self.arm.set_joint_angles(angles, duration=0.5)
-            time.sleep(0.5)
-            
-            print("5. 提升物体...")
-            self._lift_object(self.lift_height)
-            time.sleep(0.5)
-            
-            print("✓ 纵向抓取完成")
-            return True
-            
-        except Exception as e:
-            print(f"抓取失败: {e}")
-            return False
-    
-    def _move_above_target(self, target_pos: Tuple[float, float], height: float):
-        angles = self.arm.get_joint_angles()
-        if angles is None:
-            return
-        
-        target_x, target_y = target_pos
-        
-        shoulder_pan = np.arctan2(target_y, target_x) if abs(target_x) > 0.01 else 0
-        
-        distance = np.sqrt(target_x**2 + target_y**2)
-        
-        shoulder_lift = 0.3 + height * 2
-        elbow_flex = -0.5 - distance * 0.3
-        
-        angles[0] = np.clip(shoulder_pan, -1.92, 1.92)
-        angles[1] = np.clip(shoulder_lift, -1.75, 1.75)
-        angles[2] = np.clip(elbow_flex, -1.69, 1.69)
-        
-        self.arm.set_joint_angles(angles, duration=1.5)
-    
-    def _move_to_grasp_height(self, target_pos: Tuple[float, float], height: float):
-        angles = self.arm.get_joint_angles()
-        if angles is None:
-            return
-        
-        angles[1] = angles[1] - 0.2
-        angles[2] = angles[2] + 0.3
-        
-        self.arm.set_joint_angles(angles, duration=1.0)
-    
-    def _lift_object(self, height: float):
-        angles = self.arm.get_joint_angles()
-        if angles is None:
-            return
-        
-        angles[1] = angles[1] + 0.3
-        angles[2] = angles[2] - 0.2
-        
-        self.arm.set_joint_angles(angles, duration=1.0)
     
     def release_object(self) -> bool:
-        if not self.arm.connected:
-            return False
-        
+        """释放物体"""
         print("释放物体...")
         angles = self.arm.get_joint_angles()
         if angles is not None:
-            angles[5] = self.gripper_open
+            angles[5] = self.GRIPPER_OPEN
             self.arm.set_joint_angles(angles, duration=0.5)
-        
+        time.sleep(0.3)
         return True
     
-    def return_to_home(self) -> bool:
-        if not self.arm.connected:
-            return False
-        
+    def return_home(self) -> bool:
+        """返回初始位置"""
         print("返回初始位置...")
         self.arm.move_to_neutral(duration=1.5)
         return True
-    
-    def set_grasp_parameters(self, approach_height: float = None, 
-                             grasp_height: float = None,
-                             lift_height: float = None,
-                             gripper_open: float = None,
-                             gripper_close: float = None):
-        if approach_height is not None:
-            self.approach_height = approach_height
-        if grasp_height is not None:
-            self.grasp_height = grasp_height
-        if lift_height is not None:
-            self.lift_height = lift_height
-        if gripper_open is not None:
-            self.gripper_open = gripper_open
-        if gripper_close is not None:
-            self.gripper_close_horizontal = gripper_close
-            self.gripper_close_vertical = gripper_close
 
 
 class GraspExecutor:
-    """抓取执行器 - 提供更高级的抓取控制"""
+    """抓取执行器"""
     
-    def __init__(self, arm: SOARM101Controller, calibration_dir: str = 'calibration_data'):
-        self.strategy = GraspingStrategy(arm)
+    def __init__(self, arm: SOARM101Controller, camera: WristCamera = None, 
+                 calibration_dir: str = 'calibration_data'):
+        if camera is None:
+            camera = WristCamera(camera_id=1)
+        self.visual_servo = VisualServoGrasp(arm, camera)
         self.arm = arm
-        self.transformer = CoordinateTransformer(calibration_dir)
-        self.default_depth = 0.25
+        self.camera = camera
     
-    def auto_grasp(self, obj_info: Dict) -> bool:
-        if not obj_info:
-            print("错误: 无物体信息")
-            return False
-        
-        grasp_type = obj_info.get('grasp_type', 'vertical')
-        position = obj_info.get('center', (320, 240))
-        orientation = obj_info.get('orientation', 0)
-        
-        target_3d = self._image_to_3d(position)
-        
-        if target_3d is None:
-            print("错误: 无法计算目标位置")
-            return False
-        
-        return self.strategy.execute_grasp(target_3d, grasp_type, orientation)
+    def auto_grasp(self, grasp_info: Dict = None) -> bool:
+        """自动抓取"""
+        return self.visual_servo.execute_grasp(show_display=True)
     
-    def _image_to_3d(self, image_pos: Tuple[int, int], depth: float = None) -> Optional[Tuple[float, float]]:
-        if depth is None:
-            depth = self.default_depth
-        
-        if self.transformer.is_calibrated():
-            ee_pos, ee_rot = self.arm.forward_kinematics()
-            if ee_pos is not None and ee_rot is not None:
-                point_base = self.transformer.image_to_base(
-                    image_pos, depth, ee_pos, ee_rot
-                )
-                if point_base is not None:
-                    print(f"[坐标转换] 图像{image_pos} -> 基座({point_base[0]*1000:.1f}, {point_base[1]*1000:.1f}, {point_base[2]*1000:.1f})mm")
-                    return (point_base[0], point_base[1])
-        
-        cx, cy = image_pos
-        x = (cx - 320) * 0.001 * depth
-        y = (cy - 240) * 0.001 * depth
-        return (x + 0.2, y)
-    
-    def test_grasp_horizontal(self):
-        print("\n测试横向抓取...")
-        return self.strategy.execute_grasp((0.25, 0), 'horizontal', 0)
-    
-    def test_grasp_vertical(self):
-        print("\n测试纵向抓取...")
-        return self.strategy.execute_grasp((0.25, 0), 'vertical', 0)
+    def test_grasp(self):
+        """测试抓取"""
+        return self.visual_servo.execute_grasp(show_display=True)
     
     def test_release(self):
-        return self.strategy.release_object()
+        """测试释放"""
+        return self.visual_servo.release_object()
 
 
 def main():
     import sys
+    import os
+    
     port = sys.argv[1] if len(sys.argv) > 1 else 'COM18'
     
     print("="*60)
-    print("抓取策略测试")
+    print("视觉伺服抓取测试")
     print("="*60)
     
-    arm = SOARM101Controller(port)
+    urdf_path = os.path.join(os.path.dirname(__file__), '..', 'SO-ARM100', 'Simulation', 'SO101', 'so101_new_calib.urdf')
+    arm = SOARM101Controller(port, urdf_path=urdf_path)
+    camera = WristCamera(camera_id=1)
     
     if not arm.connect():
         print("无法连接机械臂")
         return
     
-    executor = GraspExecutor(arm)
+    if not camera.is_ready():
+        print("摄像头未就绪")
+        arm.disconnect()
+        return
+    
+    executor = GraspExecutor(arm, camera)
     
     print("\n测试选项:")
-    print("1. 测试横向抓取")
-    print("2. 测试纵向抓取")
+    print("1. 测试居中")
+    print("2. 测试完整抓取")
     print("3. 测试释放")
     print("4. 返回初始位置")
     print("q. 退出")
@@ -301,14 +290,15 @@ def main():
         if cmd == 'q':
             break
         elif cmd == '1':
-            executor.test_grasp_horizontal()
+            executor.visual_servo.visual_servo_center(show_display=True)
         elif cmd == '2':
-            executor.test_grasp_vertical()
+            executor.test_grasp()
         elif cmd == '3':
             executor.test_release()
         elif cmd == '4':
             arm.move_to_neutral()
     
+    camera.release()
     arm.disconnect()
     print("\n测试完成")
 
