@@ -25,7 +25,7 @@ class VisualServoGrasp:
     GRIPPER_CLOSE = -1.0
     WRIST_ROLL_ANGLE = -np.pi / 2
     
-    CENTER_ADJUST_ANGLE = -0.087
+    CENTER_ADJUST_ANGLE = -0.1
     
     def __init__(self, arm: SOARM101Controller, camera: WristCamera):
         self.arm = arm
@@ -168,7 +168,7 @@ class VisualServoGrasp:
             if not self.visual_servo_center(show_display):
                 print("居中失败，尝试继续...")
             
-            print("\n[步骤3.5] 向左微调5度...")
+            print("\n[步骤3.5] 向左微调10度...")
             angles = self.arm.get_joint_angles()
             if angles is not None:
                 angles[0] += self.CENTER_ADJUST_ANGLE
@@ -182,13 +182,48 @@ class VisualServoGrasp:
                 self.arm.move_to_xyz([current_pos[0], current_pos[1], self.GRASP_Z], duration=1.5)
             time.sleep(0.5)
             
-            print("\n[步骤5] 向前移动100mm...")
+            angles_after_descend = self.arm.get_joint_angles()
+            wrist_z_at_grasp = None
+            if angles_after_descend is not None:
+                wrist_z_at_grasp = self.arm.get_wrist_position(angles_after_descend[:5])[2]
+                print(f"[步骤5] 当前腕部Z高度: {wrist_z_at_grasp*1000:.1f}mm, 将保持此高度前进")
+
+            print("\n[步骤4.5] 降低腕部高度至50mm (保持末端位置不变)...")
+            current_end_pos = self.arm.get_current_xyz()
+            if current_end_pos is not None and angles_after_descend is not None:
+                new_angles_45 = self.arm.inverse_kinematics_constrained(
+                    current_end_pos,
+                    q_init=angles_after_descend[:5],
+                    wrist_z_target=0.050,
+                    wrist_z_weight=8.0,
+                    max_iter=200,
+                    eps=1e-4,
+                    damping=0.15,
+                    free_joints=[0,1,2,3]
+                )
+                if new_angles_45 is not None:
+                    new_angles_full = np.zeros(6)
+                    new_angles_full[:5] = new_angles_45
+                    new_angles_full[5] = angles_after_descend[5]
+                    self.arm.set_joint_angles(new_angles_full, duration=1.5)
+                    time.sleep(0.5)
+                    wrist_z_at_grasp = 0.050
+                    new_wrist_z = self.arm.get_wrist_position(new_angles_45)[2]
+                    print(f"  ✓ 腕部高度已降至 {new_wrist_z*1000:.1f}mm")
+                else:
+                    print("  ⚠ IK无解, 保持当前腕部高度继续")
+
+            print("\n[步骤5] 向前移动100mm (保持腕部Z不变, 末端直线运动)...")
             current_pos = self.arm.get_current_xyz()
             if current_pos is not None:
                 target_x = current_pos[0] + self.FORWARD_DISTANCE
                 target_y = current_pos[1]
                 target_z = self.GRASP_Z
-                self.arm.move_to_xyz([target_x, target_y, target_z], duration=1.5)
+                self.arm.move_linear([target_x, target_y, target_z],
+                                     wrist_z=wrist_z_at_grasp,
+                                     duration=1.5,
+                                     num_steps=30,
+                                     free_joints=[0,1,2,3])
             time.sleep(0.5)
             
             print("\n[步骤6] 闭合夹爪...")

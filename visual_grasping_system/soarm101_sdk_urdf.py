@@ -333,14 +333,8 @@ class SOARM101Controller:
         if angles is None:
             angles = self.get_joint_angles()[:5]
         
-        urdf_order = [0, 0, 0, 0, 0, 0]
-        for name, idx in self.joint_order.items():
-            urdf_idx = list(self.urdf.actuated_joint_names).index(name)
-            urdf_order[urdf_idx] = angles[idx]
-        
-        cfg = np.array(urdf_order)
-        
-        self.urdf.update_cfg(cfg)
+        conf = self._angles_to_cfg(angles)
+        self.urdf.update_cfg(conf)
         
         link_frame = self.urdf.get_transform(self.ee_link_name)
         
@@ -348,6 +342,35 @@ class SOARM101Controller:
         rotation = link_frame[:3, :3].copy()
         
         return position, rotation
+    
+    def _angles_to_cfg(self, angles: np.ndarray) -> np.ndarray:
+        """将5个关节角度转换为URDF配置向量"""
+        urdf_order = [0, 0, 0, 0, 0, 0]
+        for name, idx in self.joint_order.items():
+            urdf_idx = list(self.urdf.actuated_joint_names).index(name)
+            urdf_order[urdf_idx] = angles[idx]
+        return np.array(urdf_order)
+    
+    def _get_link_position(self, link_name: str, angles: np.ndarray) -> np.ndarray:
+        """获取URDF中任意链接的世界坐标"""
+        cfg = self._angles_to_cfg(angles[:5])
+        self.urdf.update_cfg(cfg)
+        transform = self.urdf.get_transform(link_name)
+        return transform[:3, 3].copy()
+    
+    def get_wrist_position(self, angles: np.ndarray = None) -> np.ndarray:
+        """
+        获取腕部 (wrist_link) 在世界坐标系中的位置
+        
+        Args:
+            angles: 5个关节角度, 默认读取当前角度
+            
+        Returns:
+            wrist_link的位置 [x, y, z] (米)
+        """
+        if angles is None:
+            angles = self.get_joint_angles()[:5]
+        return self._get_link_position("wrist_link", angles)
     
     def inverse_kinematics(self, target_pos: np.ndarray, q_init: np.ndarray = None,
                            max_iter: int = 100, eps: float = 1e-4, 
@@ -417,6 +440,188 @@ class SOARM101Controller:
         angles = self.get_joint_angles()
         pos, _ = self.forward_kinematics(angles[:5])
         return pos
+    
+    def inverse_kinematics_constrained(self, target_pos: np.ndarray,
+                                        q_init: np.ndarray = None,
+                                        wrist_z_target: float = None,
+                                        wrist_z_weight: float = 5.0,
+                                        max_iter: int = 150,
+                                        eps: float = 1e-4,
+                                        damping: float = 0.2,
+                                        free_joints: List[int] = None) -> Optional[np.ndarray]:
+        """
+        带腕部Z高度约束的逆运动学求解 (任务优先级法)
+        
+        同时优化两个目标:
+          1. 末端到达 target_pos (主要任务)
+          2. 腕部 (wrist_link) 的Z高度保持为 wrist_z_target (次要任务)
+        
+        Args:
+            target_pos: 目标末端位置 (米)
+            q_init: 初始关节角度 (5个)
+            wrist_z_target: 目标腕部Z高度 (米), None则不约束
+            wrist_z_weight: 腕部Z约束权重
+            max_iter: 最大迭代次数
+            eps: 位置收敛阈值 (米)
+            damping: 阻尼系数
+            free_joints: 需要优化的关节索引列表, 如[0,1,2,3]; None=全部优化
+            
+        Returns:
+            关节角度 (5个) 或 None
+        """
+        if not self.urdf:
+            return None
+        
+        target = np.array(target_pos)
+        if q_init is None:
+            q = np.zeros(5)
+        else:
+            q = np.array(q_init[:5])
+        
+        if free_joints is None:
+            free_joints = list(range(5))
+        n_free = len(free_joints)
+        
+        lower = np.array([self.JOINT_LIMITS[i][0] for i in range(5)])
+        upper = np.array([self.JOINT_LIMITS[i][1] for i in range(5)])
+        
+        for iteration in range(max_iter):
+            pos, _ = self.forward_kinematics(q)
+            error_pos = target - pos
+            distance = np.linalg.norm(error_pos)
+            
+            if distance < eps:
+                return np.clip(q, lower, upper)
+            
+            delta = 1e-5
+            J_pos = np.zeros((3, n_free))
+            for fi, j in enumerate(free_joints):
+                q_plus = q.copy()
+                q_plus[j] += delta
+                pos_plus, _ = self.forward_kinematics(q_plus)
+                J_pos[:, fi] = (pos_plus - pos) / delta
+            
+            if wrist_z_target is not None and iteration < max_iter * 0.9:
+                wrist_current = self._get_link_position("wrist_link", q)
+                error_wrist_z = wrist_z_target - wrist_current[2]
+                
+                J_wrist = np.zeros((1, n_free))
+                for fi, j in enumerate(free_joints):
+                    q_plus = q.copy()
+                    q_plus[j] += delta
+                    wrist_plus = self._get_link_position("wrist_link", q_plus)
+                    J_wrist[0, fi] = (wrist_plus[2] - wrist_current[2]) / delta
+                
+                J = np.vstack([J_pos, J_wrist * wrist_z_weight])
+                error = np.concatenate([error_pos, [error_wrist_z * wrist_z_weight]])
+            else:
+                J = J_pos
+                error = error_pos
+            
+            try:
+                n_tasks = J.shape[0]
+                JJT = J @ J.T
+                damped = JJT + damping**2 * np.eye(n_tasks)
+                dq_free = J.T @ np.linalg.solve(damped, error)
+                for fi, j in enumerate(free_joints):
+                    q[j] += dq_free[fi]
+                q = np.clip(q, lower, upper)
+            except np.linalg.LinAlgError:
+                return None
+        
+        final_pos, _ = self.forward_kinematics(q)
+        final_error = np.linalg.norm(target - final_pos)
+        return None if final_error > 0.05 else np.clip(q, lower, upper)
+    
+    def move_linear(self, target_xyz: List[float],
+                    wrist_z: float = None,
+                    duration: float = 2.0,
+                    num_steps: int = 30,
+                    free_joints: List[int] = None) -> bool:
+        """
+        笛卡尔空间直线运动
+        
+        在起点和终点之间插值N个中间点, 每个点都用IK求解,
+        确保末端走直线。可选的腕部Z约束让腕部保持水平高度。
+        
+        Args:
+            target_xyz: 目标位置 (x, y, z) 米
+            wrist_z: 目标腕部Z高度 (米), None则不约束
+            duration: 运动时间 (秒)
+            num_steps: 中间点数量 (越多轨迹越直)
+            free_joints: 需要优化的关节索引列表, 如[0,1,2,3]; None=全部优化
+            
+        Returns:
+            是否成功
+        """
+        if not self.connected or not self.urdf:
+            print("[ERROR] move_linear(): 机械臂未连接或URDF未加载")
+            return False
+        
+        target = np.array(target_xyz)
+        current_pos = self.get_current_xyz()
+        
+        print(f"[MOVE_LINEAR] 直线运动:")
+        print(f"  起点: ({current_pos[0]*1000:.1f}, {current_pos[1]*1000:.1f}, {current_pos[2]*1000:.1f}) mm")
+        print(f"  终点: ({target[0]*1000:.1f}, {target[1]*1000:.1f}, {target[2]*1000:.1f}) mm")
+        if wrist_z is not None:
+            print(f"  腕部Z约束: {wrist_z*1000:.1f} mm")
+        
+        current_angles = self.get_joint_angles()
+        q_current = current_angles[:5].copy()
+        
+        target_angles = self.forward_kinematics(q_current)
+        if target_angles is None:
+            print("[MOVE_LINEAR] 无法获取当前末端位置")
+            return False
+        
+        waypoint_angles = []
+        
+        for step in range(num_steps + 1):
+            t = step / num_steps
+            interp_pos = current_pos + (target - current_pos) * t
+            
+            q = self.inverse_kinematics_constrained(
+                interp_pos,
+                q_init=q_current,
+                wrist_z_target=wrist_z,
+                wrist_z_weight=5.0,
+                max_iter=100,
+                free_joints=free_joints
+            )
+            
+            if q is None:
+                print(f"[MOVE_LINEAR] 第{step}/{num_steps}步IK无解, 终止")
+                if not waypoint_angles:
+                    return False
+                break
+            
+            waypoint_angles.append(q.copy())
+            q_current = q.copy()
+        
+        actual_steps = len(waypoint_angles) - 1
+        if actual_steps < 1:
+            return False
+        
+        dt = duration / actual_steps
+        
+        for step, q in enumerate(waypoint_angles):
+            full_angles = np.zeros(6)
+            full_angles[:5] = q
+            full_angles[5] = current_angles[5]
+            
+            for j in range(6):
+                self.bus.set_position(j + 1, int(FeetechSTS.angle_to_position(full_angles[j])))
+            
+            time.sleep(dt)
+        
+        self.current_positions = np.array([FeetechSTS.angle_to_position(full_angles[j]) for j in range(6)]).astype(int)
+        
+        final_pos, _ = self.forward_kinematics(q)
+        final_error = np.linalg.norm(target - final_pos)
+        print(f"[MOVE_LINEAR] ✓ 到达, 终点误差={final_error*1000:.1f}mm")
+        
+        return True
     
     def move_to_neutral(self, duration: float = 1.0) -> bool:
         print("[MOVE] 移动到中立位置")
