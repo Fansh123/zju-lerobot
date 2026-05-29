@@ -16,22 +16,28 @@ class VisualServoGrasp:
     CENTER_THRESHOLD_Y = 20
     
     MAX_ITERATIONS = 50
-    JOINT_STEP = 0.02
+    JOINT_STEP = 0.03
     
     GRASP_Z = 0.010
-    FORWARD_DISTANCE = 0.100
+    FORWARD_DISTANCE = 0.1
     
     GRIPPER_OPEN = 1.1
     GRIPPER_CLOSE = -1.0
     WRIST_ROLL_ANGLE = -np.pi / 2
     
-    CENTER_ADJUST_ANGLE = -0.1
+    CENTER_ADJUST_ANGLE = -0.13
+    
+    SEARCH_JOINT_LIMITS = (-1.5, 1.5)
+    SEARCH_STEP = 0.15
+    SEARCH_SWEEP_COUNT = 3
+    SEARCH_FORWARD_STEP = 0.03
     
     def __init__(self, arm: SOARM101Controller, camera: WristCamera):
         self.arm = arm
         self.camera = camera
         
         self.image_center_y = 240
+        self.search_window_name = "Object Search - Press 'q' to abort"
     
     def visual_servo_center(self, show_display: bool = True) -> bool:
         """
@@ -127,6 +133,110 @@ class VisualServoGrasp:
             if show_display:
                 self.camera.cv2.destroyWindow(window_name)
     
+    def search_for_object(self, show_display: bool = True) -> bool:
+        """
+        自主搜索物块：当视野中没有物块时，自动扫描寻找
+        
+        搜索策略：
+        1. 在当前位置左右摆动扫描
+        2. 如果没找到，向前移动一小步
+        3. 重复扫描，直到找到物块或达到最大次数
+        
+        Args:
+            show_display: 是否显示摄像头画面
+            
+        Returns:
+            是否找到物块
+        """
+        print("\n" + "="*60)
+        print("[搜索] 开始自主搜索物块...")
+        print("="*60)
+        
+        if show_display:
+            self.camera.cv2.namedWindow(self.search_window_name)
+        
+        try:
+            initial_angles = self.arm.get_joint_angles()
+            if initial_angles is None:
+                print("[搜索] 无法获取当前关节角度")
+                return False
+            
+            current_joint0 = initial_angles[0]
+            min_angle, max_angle = self.SEARCH_JOINT_LIMITS
+            
+            for sweep in range(self.SEARCH_SWEEP_COUNT):
+                print(f"\n[搜索] 第 {sweep+1}/{self.SEARCH_SWEEP_COUNT} 轮扫描")
+                
+                for direction in ['left', 'right']:
+                    print(f"  [搜索] 向{direction}扫描...")
+                    start_angle = current_joint0 if direction == 'left' else min_angle
+                    end_angle = min_angle if direction == 'left' else max_angle
+                    
+                    step_sign = -1 if direction == 'left' else 1
+                    current_angle = start_angle
+                    
+                    while (direction == 'left' and current_angle >= end_angle) or \
+                          (direction == 'right' and current_angle <= end_angle):
+                        
+                        angles = self.arm.get_joint_angles()
+                        if angles is None:
+                            break
+                        
+                        angles[0] = np.clip(current_angle, min_angle, max_angle)
+                        self.arm.set_joint_angles(angles, duration=0.15)
+                        time.sleep(0.1)
+                        
+                        frame = self.camera.get_frame()
+                        if frame is not None:
+                            cube = self.camera.detect_red_cube(frame)
+                            
+                            if cube is not None:
+                                cx, cy = cube['center']
+                                print(f"  ✓ [搜索] 找到物块！位置: ({cx}, {cy})")
+                                
+                                if show_display:
+                                    display = frame.copy()
+                                    self.camera.cv2.circle(display, (cx, cy), 10, (0, 255, 0), 2)
+                                    self.camera.cv2.putText(display, "OBJECT FOUND!", (10, 30),
+                                                           self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                                    self.camera.cv2.imshow(self.search_window_name, display)
+                                    self.camera.cv2.waitKey(500)
+                                
+                                return True
+                            
+                            if show_display:
+                                display = frame.copy()
+                                self.camera.cv2.putText(display, f"Searching... ({current_angle*57.3:.1f}°)", 
+                                                       (10, 30), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                                self.camera.cv2.imshow(self.search_window_name, display)
+                                key = self.camera.cv2.waitKey(30) & 0xFF
+                                if key == ord('q'):
+                                    print("[搜索] 用户中止")
+                                    return False
+                        
+                        current_angle += step_sign * self.SEARCH_STEP
+                    
+                    current_joint0 = angles[0] if angles is not None else current_joint0
+                
+                if sweep < self.SEARCH_SWEEP_COUNT - 1:
+                    print(f"  [搜索] 本轮未找到，向前移动 {self.SEARCH_FORWARD_STEP*1000:.0f}mm...")
+                    current_pos = self.arm.get_current_xyz()
+                    if current_pos is not None:
+                        target_pos = [
+                            current_pos[0] + self.SEARCH_FORWARD_STEP,
+                            current_pos[1],
+                            current_pos[2]
+                        ]
+                        self.arm.move_to_xyz(target_pos, duration=0.8)
+                        time.sleep(0.3)
+            
+            print("[搜索] ✗ 搜索完毕，未找到物块")
+            return False
+            
+        finally:
+            if show_display:
+                self.camera.cv2.destroyWindow(self.search_window_name)
+    
     def execute_grasp(self, show_display: bool = True) -> bool:
         """
         执行视觉伺服抓取
@@ -166,7 +276,14 @@ class VisualServoGrasp:
             
             print("\n[步骤3] 视觉伺服居中...")
             if not self.visual_servo_center(show_display):
-                print("居中失败，尝试继续...")
+                print("居中失败，开始自主搜索物块...")
+                if not self.search_for_object(show_display):
+                    print("[步骤3] ✗ 搜索失败，无法找到物块")
+                    return False
+                print("[步骤3] ✓ 搜索成功，再次尝试居中...")
+                if not self.visual_servo_center(show_display):
+                    print("[步骤3] ✗ 搜索后居中仍失败")
+                    return False
             
             print("\n[步骤3.5] 向左微调10度...")
             angles = self.arm.get_joint_angles()
@@ -317,6 +434,7 @@ def main():
     print("2. 测试完整抓取")
     print("3. 测试释放")
     print("4. 返回初始位置")
+    print("5. 测试自主搜索")
     print("q. 退出")
     
     while True:
@@ -332,6 +450,8 @@ def main():
             executor.test_release()
         elif cmd == '4':
             arm.move_to_neutral()
+        elif cmd == '5':
+            executor.visual_servo.search_for_object(show_display=True)
     
     camera.release()
     arm.disconnect()
