@@ -57,8 +57,10 @@ class PlacingStrategy:
         cfg = _load_config()
         self.start_pose = cfg.get('start_pose', [0.0, 0.0, 0.0, 0.0, 0.0, 0.87])
         self.FORWARD_COEFFICIENT = cfg.get('forward_coefficient', self.FORWARD_COEFFICIENT)
+        self.center_offset_rad = np.deg2rad(cfg.get('center_offset_deg', 3.0))
         print(f"[配置] 起始姿态: {[f'{a*57.3:.1f}°' for a in self.start_pose]}")
         print(f"[配置] 前进系数: {self.FORWARD_COEFFICIENT*1000:.1f}mm/px")
+        print(f"[配置] 居中后偏移: {np.rad2deg(self.center_offset_rad):.1f}°")
 
     def save_current_as_start_pose(self):
         ang = self.arm.get_joint_angles()
@@ -71,6 +73,14 @@ class PlacingStrategy:
         self.start_pose = cfg['start_pose']
         print(f"\n✓ 已保存当前姿态为起始姿态:")
         print(f"  {[f'{a*57.3:.1f}°' for a in self.start_pose]}")
+        return True
+
+    def set_center_offset(self, deg: float):
+        cfg = _load_config()
+        cfg['center_offset_deg'] = float(deg)
+        _save_config(cfg)
+        self.center_offset_rad = np.deg2rad(deg)
+        print(f"\n✓ 居中后偏移已更新: {deg:.1f}°")
         return True
 
     def go_to_start_pose(self):
@@ -190,14 +200,14 @@ class PlacingStrategy:
             self.camera.cv2.namedWindow(wname)
 
         try:
-            # --- Capture initial Y error before centering ---
-            initial_cy_error = 0.0
+            # --- Capture initial X error before centering ---
+            initial_cx_error = 0.0
             frame = self.camera.get_frame()
             if frame is not None:
                 r_init = self._detect_with_fallback(frame)
                 if r_init is not None:
-                    initial_cy_error = r_init['center'][1] - self.img_cy
-                    print(f"[预检测] 方框初始Y偏差: {initial_cy_error:.0f}px")
+                    initial_cx_error = r_init['center'][0] - self.img_cx
+                    print(f"[预检测] 方框初始X偏差: {initial_cx_error:.0f}px (中心={r_init['center']})")
 
             # --- Phase 1: Y-axis centering (same as grasping)
             print(f"\n[Phase1] Y轴居中 (关节0), 目标Y={self.img_cy}...")
@@ -264,10 +274,22 @@ class PlacingStrategy:
                 print("[Phase1] ⚠ Y轴居中超时")
                 return False
 
+            if abs(self.center_offset_rad) > 0.001:
+                print(f"\n[Phase1] 应用居中偏移: {np.rad2deg(self.center_offset_rad):.1f}° → 关节0")
+                ang = self.arm.get_joint_angles()
+                if ang is not None:
+                    ang[0] += self.center_offset_rad
+                    ang[0] = np.clip(ang[0], -1.5, 1.5)
+                    self.arm.set_joint_angles(ang, duration=0.3)
+                    time.sleep(0.3)
+
             # --- Phase 2: forward approach (single move_linear, keep Z + wrist Z) ---
             if self.arm.urdf is None:
                 print("[Phase2] ⚠ URDF未加载, 跳过前进阶段")
                 return False
+
+            forward_dist = abs(initial_cx_error) * self.FORWARD_COEFFICIENT
+            print(f"\n[Phase2] 初始X偏差={initial_cx_error:.0f}px → 前进距离={forward_dist*1000:.1f}mm (系数={self.FORWARD_COEFFICIENT*1000:.1f}mm/px)")
 
             ang_before = self.arm.get_joint_angles()
             wrist_z_current = None
@@ -280,11 +302,11 @@ class PlacingStrategy:
                 print("[Phase2] ✗ 无法获取当前位置")
                 return False
 
-            target_x = current_pos[0] + self.FORWARD_DISTANCE
+            target_x = current_pos[0] + forward_dist
             target_y = current_pos[1]
             target_z = current_pos[2]
 
-            print(f"\n[Phase2] 向前直线运动:")
+            print(f"[Phase2] 向前直线运动:")
             print(f"  起点: ({current_pos[0]*1000:.1f}, {current_pos[1]*1000:.1f}, {current_pos[2]*1000:.1f}) mm")
             print(f"  终点: ({target_x*1000:.1f}, {target_y*1000:.1f}, {target_z*1000:.1f}) mm")
             if wrist_z_current is not None:
@@ -388,10 +410,13 @@ def main():
 
     print("\n测试选项:")
     print("0. 摄像头调试预览 (看画面+红色mask)")
-    print("1. 检测方框 (线延长法)")
+    print("1. 检测方框")
     print("2. 方框视觉伺服居中")
     print("3. 执行完整放置")
     print("4. 返回初始位置")
+    print("5. 前往起始姿态 (摄像头朝下)")
+    print("6. 保存当前姿态为起始姿态")
+    print("7. 设置居中后偏移角度 (当前: {:.1f}°)".format(np.rad2deg(placing.center_offset_rad)))
     print("q. 退出")
 
     while True:
@@ -412,6 +437,16 @@ def main():
             placing.place_object(show_display=True)
         elif cmd == '4':
             arm.move_to_neutral()
+        elif cmd == '5':
+            placing.go_to_start_pose()
+        elif cmd == '6':
+            placing.save_current_as_start_pose()
+        elif cmd == '7':
+            try:
+                deg = float(input("输入偏移角度(度, 正值=向右): ").strip())
+                placing.set_center_offset(deg)
+            except ValueError:
+                print("✗ 请输入有效数字")
 
     camera.release()
     arm.disconnect()
