@@ -151,7 +151,7 @@ class WristCamera:
             
             if len(approx) == 4:
                 area = self.cv2.contourArea(contour)
-                if area > 2000:
+                if area > 100:
                     x, y, w, h = self.cv2.boundingRect(approx)
                     aspect_ratio = float(w) / h if h > 0 else 0
                     
@@ -173,8 +173,79 @@ class WristCamera:
         
         return max(frame_contours, key=lambda x: x['area'])
     
+    def detect_red_frame_rect(self, frame: np.ndarray = None,
+                              min_area: int = 200, max_area: int = 200000) -> Optional[Dict]:
+        if frame is None:
+            frame = self.get_frame()
+        if frame is None:
+            return None
+
+        hsv = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2HSV)
+        mask1 = self.cv2.inRange(hsv, self.red_hsv_low1, self.red_hsv_high1)
+        mask2 = self.cv2.inRange(hsv, self.red_hsv_low2, self.red_hsv_high2)
+        mask = self.cv2.bitwise_or(mask1, mask2)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel, iterations=3)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        candidates = []
+        for contour in contours:
+            area = self.cv2.contourArea(contour)
+            if area < min_area or area > max_area:
+                continue
+            candidates.append(contour)
+
+        if not candidates:
+            return None
+
+        contour = max(candidates, key=lambda c: self.cv2.contourArea(c))
+
+        rect = self.cv2.minAreaRect(contour)
+        center = (int(rect[0][0]), int(rect[0][1]))
+        corners = self.cv2.boxPoints(rect)
+
+        w, h = rect[1]
+        if min(w, h) < 5:
+            return None
+        aspect = max(w, h) / (min(w, h) + 1e-6)
+        if aspect > 2.5:
+            return None
+
+        if not (0 <= center[0] < self.resolution[0] and 0 <= center[1] < self.resolution[1]):
+            return None
+
+        return {
+            'center': center,
+            'corners': corners,
+            'diags': [(corners[0], corners[2]), (corners[1], corners[3])],
+            'bounds': [],
+            'area': area,
+            'aspect': aspect
+        }
+
+    def draw_frame_rect(self, frame: np.ndarray, result: Dict) -> np.ndarray:
+        d = frame.copy()
+        cs = result['corners'].astype(int)
+        self.cv2.drawContours(d, [cs], 0, (255, 0, 0), 2)
+        self.cv2.line(d, tuple(cs[0]), tuple(cs[2]), (0, 255, 255), 1)
+        self.cv2.line(d, tuple(cs[1]), tuple(cs[3]), (0, 255, 255), 1)
+        cx, cy = result['center']
+        self.cv2.circle(d, (cx, cy), 8, (0, 0, 255), -1)
+        self.cv2.circle(d, (cx, cy), 12, (0, 0, 255), 2)
+        area = result.get('area', '?')
+        self.cv2.putText(d, f"({cx},{cy}) a={area}", (cx - 50, cy - 20),
+                         self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        for i, c in enumerate(cs):
+            self.cv2.circle(d, tuple(c), 5, (0, 255, 0), -1)
+        return d
+
     def detect_red_frame_lines(self, frame: np.ndarray = None,
-                               min_line_len: int = 30, max_line_gap: int = 12) -> Optional[Dict]:
+                               min_line_len: int = 10, max_line_gap: int = 8) -> Optional[Dict]:
         if frame is None:
             frame = self.get_frame()
         if frame is None:
@@ -188,9 +259,9 @@ class WristCamera:
         kernel = np.ones((3, 3), np.uint8)
         mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        edges = self.cv2.Canny(mask, 30, 100, apertureSize=3)
+        edges = self.cv2.Canny(mask, 20, 60, apertureSize=3)
 
-        lines = self.cv2.HoughLinesP(edges, 1, np.pi/180, threshold=40,
+        lines = self.cv2.HoughLinesP(edges, 1, np.pi/180, threshold=15,
                                       minLineLength=min_line_len, maxLineGap=max_line_gap)
         if lines is None or len(lines) < 4:
             return None

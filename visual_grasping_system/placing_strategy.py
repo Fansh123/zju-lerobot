@@ -6,20 +6,37 @@
 
 import numpy as np
 import time
+import os
+import yaml
 from typing import Optional, Dict, Tuple
 from wrist_camera import WristCamera
 from soarm101_sdk_urdf import SOARM101Controller
 
 
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'placing_config.yaml')
+
+
+def _load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'r') as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _save_config(cfg):
+    with open(CONFIG_PATH, 'w') as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+    print(f"✓ 配置已保存: {CONFIG_PATH}")
+
+
 class PlacingStrategy:
     """视觉伺服放置策略"""
 
-    CENTER_THRESHOLD_X = 15
-    APPROACH_THRESHOLD_Y = 25
+    CENTER_THRESHOLD_Y = 20
 
     MAX_ITER = 60
-    LR_STEP = 0.025
-    FWD_STEP = 0.006
+    JOINT_STEP = 0.025
+    FORWARD_COEFFICIENT = 0.0015
 
     PLACE_Z = 0.015
     RETRACT_Z = 0.12
@@ -33,13 +50,135 @@ class PlacingStrategy:
 
         self.img_cx = 320
         self.img_cy = 240
-        self.approach_target_y = 400
+
+        self._load_placing_config()
+
+    def _load_placing_config(self):
+        cfg = _load_config()
+        self.start_pose = cfg.get('start_pose', [0.0, 0.0, 0.0, 0.0, 0.0, 0.87])
+        self.FORWARD_COEFFICIENT = cfg.get('forward_coefficient', self.FORWARD_COEFFICIENT)
+        print(f"[配置] 起始姿态: {[f'{a*57.3:.1f}°' for a in self.start_pose]}")
+        print(f"[配置] 前进系数: {self.FORWARD_COEFFICIENT*1000:.1f}mm/px")
+
+    def save_current_as_start_pose(self):
+        ang = self.arm.get_joint_angles()
+        if ang is None:
+            print("✗ 无法获取当前关节角度")
+            return False
+        cfg = _load_config()
+        cfg['start_pose'] = [float(a) for a in ang]
+        _save_config(cfg)
+        self.start_pose = cfg['start_pose']
+        print(f"\n✓ 已保存当前姿态为起始姿态:")
+        print(f"  {[f'{a*57.3:.1f}°' for a in self.start_pose]}")
+        return True
+
+    def go_to_start_pose(self):
+        print(f"\n[起始姿态] 移动到保存的起始位置...")
+        self.arm.set_joint_angles(self.start_pose, duration=2.0)
+        time.sleep(0.5)
+        print("[起始姿态] ✓ 已到达起始位置")
+
+    def camera_debug_preview(self):
+        print("\n[调试] 摄像头预览 - 按 'q' 退出, 按 's' 保存当前帧")
+        print("  显示: 原始画面 | 红色mask | 边缘检测")
+        wname = "Camera Debug"
+        self.camera.cv2.namedWindow(wname)
+
+        while True:
+            frame = self.camera.get_frame()
+            if frame is None:
+                continue
+
+            hsv = self.camera.cv2.cvtColor(frame, self.camera.cv2.COLOR_BGR2HSV)
+            mask1 = self.camera.cv2.inRange(hsv, self.camera.red_hsv_low1, self.camera.red_hsv_high1)
+            mask2 = self.camera.cv2.inRange(hsv, self.camera.red_hsv_low2, self.camera.red_hsv_high2)
+            mask = self.camera.cv2.bitwise_or(mask1, mask2)
+
+            k3 = np.ones((3, 3), np.uint8)
+            mask_closed = self.camera.cv2.morphologyEx(mask, self.camera.cv2.MORPH_CLOSE, k3, iterations=2)
+            edges_disp = self.camera.cv2.Canny(mask_closed, 20, 60)
+
+            r = self.camera.detect_red_frame_rect(frame)
+            r2 = self.camera.detect_red_frame_lines(frame, min_line_len=8, max_line_gap=10)
+            r3 = self.camera.detect_red_frame(frame)
+
+            overlay = frame.copy()
+            self.camera.cv2.line(overlay, (self.img_cx, 0), (self.img_cx, 480), (0, 255, 0), 1)
+            self.camera.cv2.line(overlay, (0, self.img_cy), (640, self.img_cy), (0, 255, 0), 1)
+
+            if r is not None:
+                overlay = self.camera.draw_frame_rect(overlay, r)
+                cx, cy = r['center']
+                self.camera.cv2.putText(overlay, f"Rect OK ({cx},{cy})", (10, 25),
+                                        self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            elif r2 is not None:
+                overlay = self.camera.draw_frame_lines(overlay, r2)
+                cx, cy = r2['center']
+                self.camera.cv2.putText(overlay, f"Hough OK ({cx},{cy})", (10, 25),
+                                        self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            elif r3 is not None:
+                overlay = self.camera.draw_frame_detection(overlay, r3)
+                cx, cy = r3['center']
+                self.camera.cv2.putText(overlay, f"Contour OK ({cx},{cy})", (10, 25),
+                                        self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                self.camera.cv2.putText(overlay, "NO DETECTION", (10, 25),
+                                        self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            mask_color = self.camera.cv2.cvtColor(mask, self.camera.cv2.COLOR_GRAY2BGR)
+            edges_color = self.camera.cv2.cvtColor(edges_disp, self.camera.cv2.COLOR_GRAY2BGR)
+
+            h_overlay = self.camera.cv2.resize(overlay, (320, 240))
+            h_mask = self.camera.cv2.resize(mask_color, (320, 240))
+            h_edges = self.camera.cv2.resize(edges_color, (320, 240))
+
+            top = np.hstack([h_overlay, h_mask])
+            bot = np.hstack([h_edges, np.zeros_like(h_edges)])
+            panel = np.vstack([top, bot])
+
+            self.camera.cv2.putText(panel, "Camera", (5, 15), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            self.camera.cv2.putText(panel, "Red Mask", (325, 15), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            self.camera.cv2.putText(panel, "Edges", (5, 255), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            self.camera.cv2.imshow(wname, panel)
+            key = self.camera.cv2.waitKey(30) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                import os
+                os.makedirs('debug_images', exist_ok=True)
+                n = len(os.listdir('debug_images'))
+                self.camera.cv2.imwrite(f'debug_images/frame_{n}.png', panel)
+                print(f"  保存: debug_images/frame_{n}.png")
+
+        self.camera.cv2.destroyWindow(wname)
 
     def detect_frame_center(self, frame: np.ndarray = None) -> Optional[Tuple[int, int]]:
-        result = self.camera.detect_red_frame_lines(frame)
-        if result is None:
-            return None
-        return result['center']
+        r = self.camera.detect_red_frame_lines(frame)
+        if r is not None:
+            return r['center']
+        r2 = self.camera.detect_red_frame(frame)
+        if r2 is not None:
+            return r2['center']
+        return None
+
+    def _detect_with_fallback(self, frame):
+        r = self.camera.detect_red_frame_rect(frame)
+        if r is not None:
+            return r
+        r2 = self.camera.detect_red_frame_lines(frame, min_line_len=8, max_line_gap=10)
+        if r2 is not None:
+            return r2
+        r3 = self.camera.detect_red_frame(frame)
+        if r3 is not None:
+            return {
+                'center': r3['center'],
+                'corners': None,
+                'diags': [],
+                'bounds': []
+            }
+        return None
 
     def servo_frame_center(self, show_display: bool = True) -> bool:
         print("\n" + "=" * 60)
@@ -51,14 +190,23 @@ class PlacingStrategy:
             self.camera.cv2.namedWindow(wname)
 
         try:
-            # --- Phase 1: left-right centering ---
-            print("\n[Phase1] 左右居中 (关节0)...")
+            # --- Capture initial Y error before centering ---
+            initial_cy_error = 0.0
+            frame = self.camera.get_frame()
+            if frame is not None:
+                r_init = self._detect_with_fallback(frame)
+                if r_init is not None:
+                    initial_cy_error = r_init['center'][1] - self.img_cy
+                    print(f"[预检测] 方框初始Y偏差: {initial_cy_error:.0f}px")
+
+            # --- Phase 1: Y-axis centering (same as grasping)
+            print(f"\n[Phase1] Y轴居中 (关节0), 目标Y={self.img_cy}...")
             for i in range(self.MAX_ITER):
                 frame = self.camera.get_frame()
                 if frame is None:
                     continue
 
-                r = self.camera.detect_red_frame_lines(frame)
+                r = self._detect_with_fallback(frame)
                 if r is None:
                     print(f"  [{i+1}] 未检测到方框")
                     disp = frame.copy()
@@ -71,29 +219,41 @@ class PlacingStrategy:
                     continue
 
                 cx, cy = r['center']
-                disp = self.camera.draw_frame_lines(frame, r)
-                self.camera.cv2.line(disp, (self.img_cx, 0), (self.img_cx, 480), (0, 255, 0), 1)
+                if r['corners'] is not None and len(r['corners']) == 4:
+                    disp = self.camera.draw_frame_rect(frame, r)
+                else:
+                    disp = frame.copy()
+                    self.camera.cv2.circle(disp, (cx, cy), 12, (0, 0, 255), 2)
+                    self.camera.cv2.circle(disp, (cx, cy), 5, (0, 0, 255), -1)
                 self.camera.cv2.line(disp, (0, self.img_cy), (640, self.img_cy), (0, 255, 0), 1)
 
-                err_x = cx - self.img_cx
-                self.camera.cv2.putText(disp, f"X err={err_x}px", (10, 30),
+                error_y = cy - self.img_cy
+                if error_y < 0:
+                    direction = "UP -> Turn RIGHT"
+                else:
+                    direction = "UP -> Turn LEFT" if error_y > 0 else "CENTERED"
+
+                self.camera.cv2.putText(disp, f"Y err={error_y}px ({direction})", (10, 30),
                                         self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                if abs(err_x) < self.CENTER_THRESHOLD_X:
-                    print(f"[Phase1] ✓ 左右居中完成 (X误差={err_x}px)")
-                    self.camera.cv2.putText(disp, "LR CENTERED", (10, 60),
+                if abs(error_y) < self.CENTER_THRESHOLD_Y:
+                    print(f"[Phase1] ✓ Y轴居中完成 (误差={error_y}px)")
+                    self.camera.cv2.putText(disp, "Y CENTERED", (10, 60),
                                             self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     if show_display:
                         self.camera.cv2.imshow(wname, disp)
                         self.camera.cv2.waitKey(300)
                     break
 
+                print(f"  [{i+1}] Y偏差: {error_y}px ({direction})")
                 ang = self.arm.get_joint_angles()
                 if ang is not None:
-                    ang[0] += -self.LR_STEP if err_x > 0 else self.LR_STEP
+                    if error_y < 0:
+                        ang[0] += self.JOINT_STEP
+                    else:
+                        ang[0] -= self.JOINT_STEP
                     ang[0] = np.clip(ang[0], -1.5, 1.5)
                     self.arm.set_joint_angles(ang, duration=0.15)
-                    print(f"  [{i+1}] X误差={err_x}px -> 调整关节0")
 
                 if show_display:
                     self.camera.cv2.imshow(wname, disp)
@@ -101,59 +261,62 @@ class PlacingStrategy:
                         return False
                 time.sleep(0.1)
             else:
-                print("[Phase1] ⚠ 左右居中超时")
+                print("[Phase1] ⚠ Y轴居中超时")
                 return False
 
-            # --- Phase 2: forward approach ---
-            print("\n[Phase2] 向前平移, 方框Y中心 → 画面底部...")
-            for i in range(self.MAX_ITER):
-                frame = self.camera.get_frame()
-                if frame is None:
-                    continue
+            # --- Phase 2: forward approach (single move_linear, keep Z + wrist Z) ---
+            if self.arm.urdf is None:
+                print("[Phase2] ⚠ URDF未加载, 跳过前进阶段")
+                return False
 
-                r = self.camera.detect_red_frame_lines(frame)
-                if r is None:
-                    print(f"  [{i+1}] 未检测到方框")
-                    time.sleep(0.1)
-                    continue
+            ang_before = self.arm.get_joint_angles()
+            wrist_z_current = None
+            if ang_before is not None:
+                wrist_z_current = self.arm.get_wrist_position(ang_before[:5])[2]
+                print(f"[Phase2] 当前腕部Z高度: {wrist_z_current*1000:.1f}mm, 将保持此高度前进")
 
-                cx, cy = r['center']
-                disp = self.camera.draw_frame_lines(frame, r)
-                self.camera.cv2.line(disp, (0, self.approach_target_y), (640, self.approach_target_y),
-                                     (0, 0, 255), 2)
-                self.camera.cv2.line(disp, (0, self.img_cy), (640, self.img_cy), (0, 255, 0), 1)
+            current_pos = self.arm.get_current_xyz()
+            if current_pos is None:
+                print("[Phase2] ✗ 无法获取当前位置")
+                return False
 
-                err_y = self.approach_target_y - cy
-                self.camera.cv2.putText(disp, f"Y target={self.approach_target_y}, cy={cy}, err={err_y}",
-                                        (10, 30), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            target_x = current_pos[0] + self.FORWARD_DISTANCE
+            target_y = current_pos[1]
+            target_z = current_pos[2]
 
-                if abs(err_y) < self.APPROACH_THRESHOLD_Y:
-                    print(f"[Phase2] ✓ 到达目标 Y (误差={err_y}px)")
-                    self.camera.cv2.putText(disp, "APPROACH DONE", (10, 60),
-                                            self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    if show_display:
-                        self.camera.cv2.imshow(wname, disp)
-                        self.camera.cv2.waitKey(500)
-                    return True
+            print(f"\n[Phase2] 向前直线运动:")
+            print(f"  起点: ({current_pos[0]*1000:.1f}, {current_pos[1]*1000:.1f}, {current_pos[2]*1000:.1f}) mm")
+            print(f"  终点: ({target_x*1000:.1f}, {target_y*1000:.1f}, {target_z*1000:.1f}) mm")
+            if wrist_z_current is not None:
+                print(f"  腕部Z: {wrist_z_current*1000:.1f}mm (保持不变)")
 
-                pos = self.arm.get_current_xyz()
-                if pos is None:
-                    continue
-
-                target_x = pos[0] + self.FWD_STEP
-                target_y = pos[1]
-                target_z = pos[2]
-                self.arm.move_to_xyz([target_x, target_y, target_z], duration=0.25)
-                print(f"  [{i+1}] cy={cy} → 前进 {self.FWD_STEP*1000:.0f}mm")
-
-                if show_display:
-                    self.camera.cv2.imshow(wname, disp)
-                    if self.camera.cv2.waitKey(30) & 0xFF == ord('q'):
-                        return False
-                time.sleep(0.15)
+            ok = self.arm.move_linear([target_x, target_y, target_z],
+                                      wrist_z=wrist_z_current,
+                                      duration=1.5,
+                                      num_steps=30,
+                                      free_joints=[0, 1, 2, 3])
+            if ok:
+                print("[Phase2] ✓ 前进完成")
             else:
-                print("[Phase2] ⚠ 向前平移超时")
-                return False
+                print("[Phase2] ⚠ move_linear失败")
+
+            print("[Phase2] ✓ 方框居中流程完成")
+
+            if show_display:
+                frame = self.camera.get_frame()
+                if frame is not None:
+                    r = self._detect_with_fallback(frame)
+                    if r is not None:
+                        disp = self.camera.draw_frame_rect(frame, r) if r['corners'] is not None else frame
+                        cx, cy = r['center']
+                        self.camera.cv2.line(disp, (self.img_cx, 0), (self.img_cx, 480), (0, 255, 0), 1)
+                        self.camera.cv2.line(disp, (0, self.img_cy), (640, self.img_cy), (0, 255, 0), 1)
+                        self.camera.cv2.putText(disp, f"Final: ({cx},{cy}) err_x={cx-self.img_cx} err_y={cy-self.img_cy}",
+                                                (10, 30), self.camera.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        self.camera.cv2.imshow(wname, disp)
+                        self.camera.cv2.waitKey(1000)
+
+            return True
 
         finally:
             if show_display:
@@ -199,13 +362,19 @@ class PlacingStrategy:
 
 def main():
     import sys
+    import os
     port = sys.argv[1] if len(sys.argv) > 1 else 'COM18'
+
+    urdf_path = os.path.join(os.path.dirname(__file__), '..', 'SO-ARM100', 'Simulation', 'SO101', 'so101_new_calib.urdf')
+    if not os.path.exists(urdf_path):
+        urdf_path = None
+        print("[WARN] URDF未找到, 放置功能不可用")
 
     print("=" * 60)
     print("放置策略测试 - 视觉伺服版")
     print("=" * 60)
 
-    arm = SOARM101Controller(port)
+    arm = SOARM101Controller(port, urdf_path=urdf_path)
     camera = WristCamera(camera_id=1)
 
     if not arm.connect():
@@ -218,6 +387,7 @@ def main():
     placing = PlacingStrategy(arm, camera)
 
     print("\n测试选项:")
+    print("0. 摄像头调试预览 (看画面+红色mask)")
     print("1. 检测方框 (线延长法)")
     print("2. 方框视觉伺服居中")
     print("3. 执行完整放置")
@@ -228,6 +398,8 @@ def main():
         cmd = input("\n请选择: ").strip().lower()
         if cmd == 'q':
             break
+        elif cmd == '0':
+            placing.camera_debug_preview()
         elif cmd == '1':
             center = placing.detect_frame_center()
             if center:
