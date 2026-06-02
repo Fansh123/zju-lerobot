@@ -98,15 +98,7 @@ class VisualGrasping:
             print("任务失败: 抓取失败")
             return False
         
-        print("\n[步骤2] 检测放置区域...")
-        place_area = self.placing_strategy.detect_place_area()
-        if place_area is None:
-            print("任务失败: 未检测到放置区域")
-            return False
-        
-        print(f"检测到放置区域: 中心={place_area['image_center']}")
-        
-        print("\n[步骤3] 放置物体...")
+        print("\n[步骤2] 视觉伺服放置...")
         if not self.place_object():
             print("任务失败: 放置失败")
             return False

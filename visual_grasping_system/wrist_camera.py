@@ -173,6 +173,115 @@ class WristCamera:
         
         return max(frame_contours, key=lambda x: x['area'])
     
+    def detect_red_frame_lines(self, frame: np.ndarray = None,
+                               min_line_len: int = 30, max_line_gap: int = 12) -> Optional[Dict]:
+        if frame is None:
+            frame = self.get_frame()
+        if frame is None:
+            return None
+
+        hsv = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2HSV)
+        mask1 = self.cv2.inRange(hsv, self.red_hsv_low1, self.red_hsv_high1)
+        mask2 = self.cv2.inRange(hsv, self.red_hsv_low2, self.red_hsv_high2)
+        mask = self.cv2.bitwise_or(mask1, mask2)
+
+        kernel = np.ones((3, 3), np.uint8)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        edges = self.cv2.Canny(mask, 30, 100, apertureSize=3)
+
+        lines = self.cv2.HoughLinesP(edges, 1, np.pi/180, threshold=40,
+                                      minLineLength=min_line_len, maxLineGap=max_line_gap)
+        if lines is None or len(lines) < 4:
+            return None
+
+        group_a = []
+        group_b = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = x2 - x1
+            dy = y2 - y1
+            length = np.sqrt(dx*dx + dy*dy)
+            if length < 1:
+                continue
+            angle_ratio = abs(dy) / length
+            if angle_ratio < 0.5:
+                group_a.append(line[0])
+            else:
+                group_b.append(line[0])
+
+        if len(group_a) < 2 or len(group_b) < 2:
+            return None
+
+        group_a = sorted(group_a, key=lambda l: (l[1] + l[3]) / 2.0)
+        group_b = sorted(group_b, key=lambda l: (l[0] + l[2]) / 2.0)
+
+        la_top = self._extend_line(group_a[0])
+        la_bot = self._extend_line(group_a[-1])
+        lb_lef = self._extend_line(group_b[0])
+        lb_rig = self._extend_line(group_b[-1])
+
+        corners = []
+        for la, lb in [(la_top, lb_lef), (la_top, lb_rig),
+                        (la_bot, lb_lef), (la_bot, lb_rig)]:
+            pt = self._intersect_lines(la, lb)
+            if pt is not None:
+                corners.append(pt)
+
+        if len(corners) != 4:
+            return None
+
+        corners = np.array(corners, dtype=np.float32)
+        center = np.mean(corners, axis=0)
+        cx, cy = int(center[0]), int(center[1])
+
+        if not (0 <= cx < self.resolution[0] and 0 <= cy < self.resolution[1]):
+            return None
+
+        return {
+            'center': (cx, cy),
+            'corners': corners,
+            'diags': [(corners[0], corners[3]), (corners[1], corners[2])],
+            'bounds': [la_top, la_bot, lb_lef, lb_rig]
+        }
+
+    @staticmethod
+    def _extend_line(seg):
+        x1, y1, x2, y2 = seg
+        dx = x2 - x1
+        dy = y2 - y1
+        dn = np.sqrt(dx*dx + dy*dy)
+        if dn < 1e-6:
+            return (x1, y1, x1 + 1, y1)
+        s = 5000.0 / dn
+        return (x1 - dx*s, y1 - dy*s, x2 + dx*s, y2 + dy*s)
+
+    @staticmethod
+    def _intersect_lines(l1, l2):
+        x1, y1, x2, y2 = l1
+        x3, y3, x4, y4 = l2
+        d = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+        if abs(d) < 1e-8:
+            return None
+        t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / d
+        return (x1 + t*(x2-x1), y1 + t*(y3-y1))
+
+    def draw_frame_lines(self, frame: np.ndarray, result: Dict) -> np.ndarray:
+        d = frame.copy()
+        cs = result['corners'].astype(int)
+        for i in range(4):
+            self.cv2.line(d, tuple(cs[i]), tuple(cs[(i+1)%4]), (255, 0, 0), 2)
+        for di in result['diags']:
+            self.cv2.line(d, tuple(di[0].astype(int)), tuple(di[1].astype(int)), (0, 255, 255), 1)
+        cx, cy = result['center']
+        self.cv2.circle(d, (cx, cy), 8, (0, 0, 255), -1)
+        self.cv2.circle(d, (cx, cy), 12, (0, 0, 255), 2)
+        self.cv2.putText(d, f"({cx},{cy})", (cx-40, cy-20),
+                         self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        for i, c in enumerate(cs):
+            self.cv2.circle(d, tuple(c), 5, (0, 255, 0), -1)
+        return d
+
     def draw_cube_detection(self, frame: np.ndarray, cube: Dict) -> np.ndarray:
         result = frame.copy()
         
