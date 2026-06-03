@@ -32,7 +32,7 @@ def _save_config(cfg):
 class PlacingStrategy:
     """视觉伺服放置策略"""
 
-    CENTER_THRESHOLD_Y = 20
+    CENTER_THRESHOLD_Y = 8
 
     MAX_ITER = 60
     JOINT_STEP = 0.025
@@ -200,15 +200,6 @@ class PlacingStrategy:
             self.camera.cv2.namedWindow(wname)
 
         try:
-            # --- Capture initial X error before centering ---
-            initial_cx_error = 0.0
-            frame = self.camera.get_frame()
-            if frame is not None:
-                r_init = self._detect_with_fallback(frame)
-                if r_init is not None:
-                    initial_cx_error = r_init['center'][0] - self.img_cx
-                    print(f"[预检测] 方框初始X偏差: {initial_cx_error:.0f}px (中心={r_init['center']})")
-
             # --- Phase 1: Y-axis centering (same as grasping)
             print(f"\n[Phase1] Y轴居中 (关节0), 目标Y={self.img_cy}...")
             for i in range(self.MAX_ITER):
@@ -283,13 +274,25 @@ class PlacingStrategy:
                     self.arm.set_joint_angles(ang, duration=0.3)
                     time.sleep(0.3)
 
+            current_cx_error = 0.0
+            frame = self.camera.get_frame()
+            if frame is not None:
+                r_post = self._detect_with_fallback(frame)
+                if r_post is not None:
+                    current_cx_error = r_post['center'][0] - self.img_cx
+                    print(f"[Phase2] 居中后方框X偏差: {current_cx_error:.0f}px (中心={r_post['center']})")
+                else:
+                    print("[Phase2] ⚠ 居中后未检测到方框, 使用偏差=0")
+            else:
+                print("[Phase2] ⚠ 无法获取画面, 使用偏差=0")
+
             # --- Phase 2: forward approach (single move_linear, keep Z + wrist Z) ---
             if self.arm.urdf is None:
                 print("[Phase2] ⚠ URDF未加载, 跳过前进阶段")
                 return False
 
-            forward_dist = abs(initial_cx_error) * self.FORWARD_COEFFICIENT
-            print(f"\n[Phase2] 初始X偏差={initial_cx_error:.0f}px → 前进距离={forward_dist*1000:.1f}mm (系数={self.FORWARD_COEFFICIENT*1000:.1f}mm/px)")
+            forward_dist = abs(current_cx_error) * self.FORWARD_COEFFICIENT
+            print(f"\n[Phase2] X偏差={current_cx_error:.0f}px → 前进距离={forward_dist*1000:.1f}mm (系数={self.FORWARD_COEFFICIENT*1000:.1f}mm/px)")
 
             ang_before = self.arm.get_joint_angles()
             wrist_z_current = None
