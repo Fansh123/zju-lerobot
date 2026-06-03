@@ -330,11 +330,23 @@ class VisualServoGrasp:
                 else:
                     print("  ⚠ IK无解, 保持当前腕部高度继续")
 
-            print("\n[步骤5] 向前移动100mm (保持腕部Z不变, 末端直线运动)...")
+            print("\n[步骤5] 向前移动100mm (沿关节0径向, 保持腕部Z不变)...")
             current_pos = self.arm.get_current_xyz()
             if current_pos is not None:
+                # 沿关节0(shoulder_link)→末端的径向方向前进，与摄像头视角匹配
+                ang_step5 = self.arm.get_joint_angles()
                 target_x = current_pos[0] + self.FORWARD_DISTANCE
                 target_y = current_pos[1]
+                if ang_step5 is not None:
+                    shoulder_pos = self.arm._get_link_position("shoulder_link", ang_step5[:5])
+                    dx = current_pos[0] - shoulder_pos[0]
+                    dy = current_pos[1] - shoulder_pos[1]
+                    dist_xy = np.sqrt(dx*dx + dy*dy)
+                    if dist_xy > 0.001:
+                        target_x = current_pos[0] + (dx / dist_xy) * self.FORWARD_DISTANCE
+                        target_y = current_pos[1] + (dy / dist_xy) * self.FORWARD_DISTANCE
+                        print(f"  关节0中心: ({shoulder_pos[0]*1000:.1f}, {shoulder_pos[1]*1000:.1f}) mm")
+                        print(f"  径向方向: ({dx/dist_xy:.3f}, {dy/dist_xy:.3f})")
                 target_z = self.GRASP_Z
                 self.arm.move_linear([target_x, target_y, target_z],
                                      wrist_z=wrist_z_at_grasp,

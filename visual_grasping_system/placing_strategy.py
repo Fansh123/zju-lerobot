@@ -309,6 +309,17 @@ class PlacingStrategy:
             target_y = current_pos[1]
             target_z = current_pos[2]
 
+            if ang_before is not None:
+                shoulder_pos = self.arm._get_link_position("shoulder_link", ang_before[:5])
+                dx = current_pos[0] - shoulder_pos[0]
+                dy = current_pos[1] - shoulder_pos[1]
+                dist_xy = np.sqrt(dx*dx + dy*dy)
+                if dist_xy > 0.001:
+                    target_x = current_pos[0] + (dx / dist_xy) * forward_dist
+                    target_y = current_pos[1] + (dy / dist_xy) * forward_dist
+                    print(f"[Phase2] 关节0中心: ({shoulder_pos[0]*1000:.1f}, {shoulder_pos[1]*1000:.1f}) mm")
+                    print(f"[Phase2] 径向方向: ({dx/dist_xy:.3f}, {dy/dist_xy:.3f})")
+
             print(f"[Phase2] 向前直线运动:")
             print(f"  起点: ({current_pos[0]*1000:.1f}, {current_pos[1]*1000:.1f}, {current_pos[2]*1000:.1f}) mm")
             print(f"  终点: ({target_x*1000:.1f}, {target_y*1000:.1f}, {target_z*1000:.1f}) mm")
