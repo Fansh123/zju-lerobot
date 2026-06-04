@@ -10,7 +10,7 @@ import os
 import yaml
 from typing import Optional, Dict, Tuple
 from wrist_camera import WristCamera
-from soarm101_sdk_urdf import SOARM101Controller
+from soarm101_sdk_urdf import SOARM101Controller, FeetechSTS
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'placing_config.yaml')
@@ -97,8 +97,14 @@ class PlacingStrategy:
         cur_ang = self.arm.get_joint_angles()
         if cur_ang is not None:
             pose[5] = cur_ang[5]
+
+        print(f"[DEBUG] go_to_start_pose BEFORE: J4={pose[4]*57.3:.2f}°  raw_pos[4]={self.arm.bus.read_position(4)}")
         self.arm.set_joint_angles(pose, duration=2.0)
         time.sleep(0.5)
+
+        actual = self.arm.get_joint_angles()
+        if actual is not None:
+            print(f"[DEBUG] go_to_start_pose AFTER: J4={actual[4]*57.3:.2f}°  raw_pos[4]={self.arm.bus.read_position(4)}")
         print("[起始姿态] ✓ 已到达起始位置")
 
     def camera_debug_preview(self):
@@ -212,6 +218,13 @@ class PlacingStrategy:
             self.camera.cv2.namedWindow(wname)
 
         try:
+            # 读取一次基线，后续只调整关节0
+            baseline_angles = self.arm.get_joint_angles()
+            if baseline_angles is not None:
+                print(f"[DEBUG] servo_frame_center 进入 基线: J0={baseline_angles[0]*57.3:.2f}° J4={baseline_angles[4]*57.3:.2f}°  raw[4]={self.arm.bus.read_position(4)}")
+            else:
+                baseline_angles = None
+
             # --- Phase 1: Y-axis centering (same as grasping)
             print(f"\n[Phase1] Y轴居中 (关节0), 目标Y={self.img_cy}...")
             for i in range(self.MAX_ITER):
@@ -259,14 +272,16 @@ class PlacingStrategy:
                     break
 
                 print(f"  [{i+1}] Y偏差: {error_y}px ({direction})")
-                ang = self.arm.get_joint_angles()
-                if ang is not None:
-                    if error_y < 0:
-                        ang[0] += self.JOINT_STEP
-                    else:
-                        ang[0] -= self.JOINT_STEP
-                    ang[0] = np.clip(ang[0], -1.5, 1.5)
-                    self.arm.set_joint_angles(ang, duration=0.15)
+                if baseline_angles is not None:
+                    pos0 = self.arm.bus.read_position(1)
+                    if pos0 is not None:
+                        baseline_angles[0] = FeetechSTS.position_to_angle(pos0)
+                        if error_y < 0:
+                            baseline_angles[0] += self.JOINT_STEP
+                        else:
+                            baseline_angles[0] -= self.JOINT_STEP
+                        baseline_angles[0] = np.clip(baseline_angles[0], -1.5, 1.5)
+                        self.arm.set_joint_angles(baseline_angles, duration=0.15)
 
                 if show_display:
                     self.camera.cv2.imshow(wname, disp)
@@ -279,12 +294,17 @@ class PlacingStrategy:
 
             if abs(self.center_offset_rad) > 0.001:
                 print(f"\n[Phase1] 应用居中偏移: {np.rad2deg(self.center_offset_rad):.1f}° → 关节0")
+                print(f"[DEBUG] 偏移前: J0={baseline_angles[0]*57.3:.2f}° J4={baseline_angles[4]*57.3:.2f}°  raw[4]={self.arm.bus.read_position(4)}")
                 ang = self.arm.get_joint_angles()
                 if ang is not None:
+                    print(f"[DEBUG] get_joint_angles返回: J4={ang[4]*57.3:.2f}°")
                     ang[0] += self.center_offset_rad
                     ang[0] = np.clip(ang[0], -1.5, 1.5)
                     self.arm.set_joint_angles(ang, duration=0.3)
                     time.sleep(0.3)
+                    actual = self.arm.get_joint_angles()
+                    if actual is not None:
+                        print(f"[DEBUG] 偏移后: J4={actual[4]*57.3:.2f}°  raw[4]={self.arm.bus.read_position(4)}")
 
             current_cx_error = 0.0
             frame = self.camera.get_frame()
@@ -303,12 +323,14 @@ class PlacingStrategy:
                 print("[Phase2] ⚠ URDF未加载, 跳过前进阶段")
                 return False
 
-            forward_dist = abs(current_cx_error) * self.FORWARD_COEFFICIENT
-            print(f"\n[Phase2] X偏差={current_cx_error:.0f}px → 前进距离={forward_dist*1000:.1f}mm (系数={self.FORWARD_COEFFICIENT*1000:.1f}mm/px)")
+            forward_dist = -current_cx_error * self.FORWARD_COEFFICIENT
+            direction = "向前" if forward_dist >= 0 else "向后"
+            print(f"\n[Phase2] X偏差={current_cx_error:.0f}px → {direction}{abs(forward_dist)*1000:.1f}mm (系数={self.FORWARD_COEFFICIENT*1000:.1f}mm/px)")
 
             ang_before = self.arm.get_joint_angles()
             wrist_z_current = None
             if ang_before is not None:
+                print(f"[DEBUG] Phase2 ang_before: J0={ang_before[0]*57.3:.2f}° J4={ang_before[4]*57.3:.2f}°  raw[4]={self.arm.bus.read_position(4)}")
                 wrist_z_current = self.arm.get_wrist_position(ang_before[:5])[2]
                 print(f"[Phase2] 当前腕部Z高度: {wrist_z_current*1000:.1f}mm, 将保持此高度前进")
 
@@ -347,6 +369,10 @@ class PlacingStrategy:
                 print("[Phase2] ✓ 前进完成")
             else:
                 print("[Phase2] ⚠ move_linear失败")
+
+            after_move = self.arm.get_joint_angles()
+            if after_move is not None:
+                print(f"[DEBUG] Phase2 完成后: J4={after_move[4]*57.3:.2f}°  raw[4]={self.arm.bus.read_position(4)}")
 
             print("[Phase2] ✓ 方框居中流程完成")
 

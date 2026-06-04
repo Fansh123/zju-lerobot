@@ -617,14 +617,18 @@ class SOARM101Controller:
         
         dt = duration / actual_steps
         
+        first_j4 = waypoint_angles[0][4] if waypoint_angles else None
+        last_j4 = waypoint_angles[-1][4] if waypoint_angles else None
+        print(f"[MOVE_LINEAR] J4 angle: first={first_j4*57.3:.2f}°  last={last_j4*57.3:.2f}°  delta={(last_j4-first_j4)*57.3:.3f}°")
+
         for step, q in enumerate(waypoint_angles):
             full_angles = np.zeros(6)
             full_angles[:5] = q
             full_angles[5] = current_angles[5]
-            
+
             for j in range(6):
                 self.bus.set_position(j + 1, int(FeetechSTS.angle_to_position(full_angles[j])))
-            
+
             time.sleep(dt)
         
         self.current_positions = np.array([FeetechSTS.angle_to_position(full_angles[j]) for j in range(6)]).astype(int)

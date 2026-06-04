@@ -8,7 +8,7 @@ import time
 import os
 import yaml
 from typing import Optional, Dict
-from soarm101_sdk_urdf import SOARM101Controller
+from soarm101_sdk_urdf import SOARM101Controller, FeetechSTS
 from wrist_camera import WristCamera
 
 
@@ -71,6 +71,12 @@ class VisualServoGrasp:
             self.camera.cv2.namedWindow(window_name)
         
         try:
+            # 读取一次基线，后续只调整关节0
+            baseline_angles = self.arm.get_joint_angles()
+            if baseline_angles is None:
+                print("[视觉伺服] 无法获取关节角度")
+                return False
+
             for i in range(self.MAX_ITERATIONS):
                 frame = self.camera.get_frame()
                 if frame is None:
@@ -122,15 +128,16 @@ class VisualServoGrasp:
                     
                     print(f"  [{i+1}] Y偏差: {error_y:.0f}px ({direction})")
                     
-                    angles = self.arm.get_joint_angles()
-                    if angles is not None:
+                    # 只读取关节0，保持其他关节基线不动
+                    pos0 = self.arm.bus.read_position(1)
+                    if pos0 is not None:
+                        baseline_angles[0] = FeetechSTS.position_to_angle(pos0)
                         if error_y < 0:
-                            angles[0] += self.JOINT_STEP
+                            baseline_angles[0] += self.JOINT_STEP
                         else:
-                            angles[0] -= self.JOINT_STEP
-                        
-                        angles[0] = np.clip(angles[0], -1.5, 1.5)
-                        self.arm.set_joint_angles(angles, duration=0.2)
+                            baseline_angles[0] -= self.JOINT_STEP
+                        baseline_angles[0] = np.clip(baseline_angles[0], -1.5, 1.5)
+                        self.arm.set_joint_angles(baseline_angles, duration=0.2)
                 
                 if show_display:
                     self.camera.cv2.imshow(window_name, display)
@@ -192,12 +199,8 @@ class VisualServoGrasp:
                     while (direction == 'left' and current_angle >= end_angle) or \
                           (direction == 'right' and current_angle <= end_angle):
                         
-                        angles = self.arm.get_joint_angles()
-                        if angles is None:
-                            break
-                        
-                        angles[0] = np.clip(current_angle, min_angle, max_angle)
-                        self.arm.set_joint_angles(angles, duration=0.15)
+                        initial_angles[0] = np.clip(current_angle, min_angle, max_angle)
+                        self.arm.set_joint_angles(initial_angles, duration=0.15)
                         time.sleep(0.1)
                         
                         frame = self.camera.get_frame()
@@ -230,7 +233,7 @@ class VisualServoGrasp:
                         
                         current_angle += step_sign * self.SEARCH_STEP
                     
-                    current_joint0 = angles[0] if angles is not None else current_joint0
+                    current_joint0 = initial_angles[0]
                 
                 if sweep < self.SEARCH_SWEEP_COUNT - 1:
                     print(f"  [搜索] 本轮未找到，向前移动 {self.SEARCH_FORWARD_STEP*1000:.0f}mm...")
@@ -312,43 +315,21 @@ class VisualServoGrasp:
             if current_pos is not None:
                 self.arm.move_to_xyz([current_pos[0], current_pos[1], self.GRASP_Z], duration=1.5)
             time.sleep(0.5)
-            
+
             angles_after_descend = self.arm.get_joint_angles()
             wrist_z_at_grasp = None
             if angles_after_descend is not None:
                 wrist_z_at_grasp = self.arm.get_wrist_position(angles_after_descend[:5])[2]
                 print(f"[步骤5] 当前腕部Z高度: {wrist_z_at_grasp*1000:.1f}mm, 将保持此高度前进")
 
-            print("\n[步骤4.5] 降低腕部高度至50mm (保持末端位置不变)...")
-            current_end_pos = self.arm.get_current_xyz()
-            if current_end_pos is not None and angles_after_descend is not None:
-                new_angles_45 = self.arm.inverse_kinematics_constrained(
-                    current_end_pos,
-                    q_init=angles_after_descend[:5],
-                    wrist_z_target=0.050,
-                    wrist_z_weight=8.0,
-                    max_iter=200,
-                    eps=1e-4,
-                    damping=0.15,
-                    free_joints=[0,1,2,3]
-                )
-                if new_angles_45 is not None:
-                    new_angles_full = np.zeros(6)
-                    new_angles_full[:5] = new_angles_45
-                    new_angles_full[5] = angles_after_descend[5]
-                    self.arm.set_joint_angles(new_angles_full, duration=1.5)
-                    time.sleep(0.5)
-                    wrist_z_at_grasp = 0.050
-                    new_wrist_z = self.arm.get_wrist_position(new_angles_45)[2]
-                    print(f"  ✓ 腕部高度已降至 {new_wrist_z*1000:.1f}mm")
-                else:
-                    print("  ⚠ IK无解, 保持当前腕部高度继续")
-
             print("\n[步骤5] 向前移动100mm (沿关节0径向, 保持腕部Z不变)...")
             current_pos = self.arm.get_current_xyz()
             if current_pos is not None:
-                # 沿关节0(shoulder_link)→末端的径向方向前进，与摄像头视角匹配
                 ang_step5 = self.arm.get_joint_angles()
+                if ang_step5 is not None and wrist_z_at_grasp is None:
+                    wrist_z_at_grasp = self.arm.get_wrist_position(ang_step5[:5])[2]
+                    print(f"[步骤5] 当前腕部Z高度: {wrist_z_at_grasp*1000:.1f}mm, 将保持此高度前进")
+                # 沿关节0(shoulder_link)→末端的径向方向前进，与摄像头视角匹配
                 target_x = current_pos[0] + self.FORWARD_DISTANCE
                 target_y = current_pos[1]
                 if ang_step5 is not None:

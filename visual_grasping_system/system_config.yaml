@@ -7,7 +7,7 @@
 #  机械臂硬件连接
 # ---------------------------------------------------------------------------
 arm:
-  port: COM18                  # 串口号 (Windows: COMx, Linux: /dev/ttyUSBx)
+  port: COM20                 # 串口号 (Windows: COMx, Linux: /dev/ttyUSBx)
   baudrate: 1000000            # 波特率 (Feetech STS3215 固定1Mbps)
   urdf_path: "../SO-ARM100/Simulation/SO101/so101_new_calib.urdf"  # URDF模型路径 (相对/绝对)
 
