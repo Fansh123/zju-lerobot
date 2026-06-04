@@ -5,38 +5,52 @@
 
 import numpy as np
 import time
+import os
+import yaml
 from typing import Optional, Dict
 from soarm101_sdk_urdf import SOARM101Controller
 from wrist_camera import WristCamera
 
 
+def _load_sys_cfg():
+    path = os.path.join(os.path.dirname(__file__), 'system_config.yaml')
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
 class VisualServoGrasp:
     """视觉伺服抓取类"""
     
-    CENTER_THRESHOLD_Y = 20
-    
-    MAX_ITERATIONS = 50
-    JOINT_STEP = 0.03
-    
-    GRASP_Z = 0.010
-    FORWARD_DISTANCE = 0.1
-    
-    GRIPPER_OPEN = 1.1
-    GRIPPER_CLOSE = -1.0
-    WRIST_ROLL_ANGLE = -np.pi / 2
-    
-    CENTER_ADJUST_ANGLE = -0.13
-    
-    SEARCH_JOINT_LIMITS = (-1.5, 1.5)
-    SEARCH_STEP = 0.15
-    SEARCH_SWEEP_COUNT = 3
-    SEARCH_FORWARD_STEP = 0.03
-    
-    def __init__(self, arm: SOARM101Controller, camera: WristCamera):
+    def __init__(self, arm: SOARM101Controller, camera: WristCamera, target_color: str = 'red'):
         self.arm = arm
         self.camera = camera
-        
-        self.image_center_y = 240
+
+        cfg = _load_sys_cfg().get('grasping', {})
+
+        self.CENTER_THRESHOLD_Y = cfg.get('center_threshold_y', 20)
+        self.MAX_ITERATIONS = cfg.get('max_iterations', 50)
+        self.JOINT_STEP = cfg.get('joint_step', 0.03)
+        self.GRASP_Z = cfg.get('grasp_z', 0.010)
+        self.FORWARD_DISTANCE = cfg.get('forward_distance', 0.1)
+        self.GRIPPER_OPEN = cfg.get('gripper_open', 1.1)
+        self.GRIPPER_CLOSE = cfg.get('gripper_close', -1.0)
+        self.WRIST_ROLL_ANGLE = cfg.get('wrist_roll_angle', -np.pi/2)
+        self.CENTER_ADJUST_ANGLE = cfg.get('center_adjust_angle', -0.13)
+
+        srch = cfg.get('search', {})
+        self.SEARCH_JOINT_LIMITS = (srch.get('joint_0_min', -1.5), srch.get('joint_0_max', 1.5))
+        self.SEARCH_STEP = srch.get('step', 0.15)
+        self.SEARCH_SWEEP_COUNT = srch.get('sweep_count', 3)
+        self.SEARCH_FORWARD_STEP = srch.get('forward_step', 0.03)
+
+        if target_color == 'blue':
+            self._detect_func = self.camera.detect_blue_cube
+        else:
+            self._detect_func = self.camera.detect_red_cube
+
+        self.image_center_y = _load_sys_cfg().get('camera', {}).get('image_center_y', 240)
         self.search_window_name = "Object Search - Press 'q' to abort"
     
     def visual_servo_center(self, show_display: bool = True) -> bool:
@@ -66,7 +80,7 @@ class VisualServoGrasp:
                 
                 self.camera.cv2.line(display, (0, self.image_center_y), (640, self.image_center_y), (0, 0, 255), 2)
                 
-                cube = self.camera.detect_red_cube(frame)
+                cube = self._detect_func(frame)
                 
                 if cube is None:
                     print(f"  [{i+1}] 未检测到物块")
@@ -188,7 +202,7 @@ class VisualServoGrasp:
                         
                         frame = self.camera.get_frame()
                         if frame is not None:
-                            cube = self.camera.detect_red_cube(frame)
+                            cube = self._detect_func(frame)
                             
                             if cube is not None:
                                 cx, cy = cube['center']
@@ -347,7 +361,7 @@ class VisualServoGrasp:
                         target_y = current_pos[1] + (dy / dist_xy) * self.FORWARD_DISTANCE
                         print(f"  关节0中心: ({shoulder_pos[0]*1000:.1f}, {shoulder_pos[1]*1000:.1f}) mm")
                         print(f"  径向方向: ({dx/dist_xy:.3f}, {dy/dist_xy:.3f})")
-                target_z = self.GRASP_Z
+                target_z = current_pos[2]  # 保持当前Z不变，避免步骤4.5漂移后回拉
                 self.arm.move_linear([target_x, target_y, target_z],
                                      wrist_z=wrist_z_at_grasp,
                                      duration=1.5,

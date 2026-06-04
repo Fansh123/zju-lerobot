@@ -14,11 +14,19 @@ from soarm101_sdk_urdf import SOARM101Controller
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'placing_config.yaml')
+SYSTEM_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'system_config.yaml')
 
 
 def _load_config():
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _load_sys_cfg():
+    if os.path.exists(SYSTEM_CONFIG_PATH):
+        with open(SYSTEM_CONFIG_PATH, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f) or {}
     return {}
 
@@ -32,24 +40,23 @@ def _save_config(cfg):
 class PlacingStrategy:
     """视觉伺服放置策略"""
 
-    CENTER_THRESHOLD_Y = 8
-
-    MAX_ITER = 60
-    JOINT_STEP = 0.025
-    FORWARD_COEFFICIENT = 0.0015
-
-    PLACE_Z = 0.015
-    RETRACT_Z = 0.12
-
-    GRIPPER_OPEN = 1.1
-
     def __init__(self, arm: SOARM101Controller, camera: WristCamera = None,
-                 camera_id: int = 0):
+                 camera_id: int = None):
         self.arm = arm
         self.camera = camera if camera else WristCamera(camera_id)
 
-        self.img_cx = 320
-        self.img_cy = 240
+        cam_cfg = _load_sys_cfg().get('camera', {})
+        self.img_cx = cam_cfg.get('image_center_x', 320)
+        self.img_cy = cam_cfg.get('image_center_y', 240)
+
+        plc = _load_sys_cfg().get('placing', {})
+        self.CENTER_THRESHOLD_Y = plc.get('center_threshold_y', 8)
+        self.MAX_ITER = plc.get('max_iter', 60)
+        self.JOINT_STEP = plc.get('joint_step', 0.025)
+        self.FORWARD_COEFFICIENT = plc.get('forward_coefficient', 0.0015)
+        self.PLACE_Z = plc.get('place_z', 0.015)
+        self.RETRACT_Z = plc.get('retract_z', 0.12)
+        self.GRIPPER_OPEN = plc.get('gripper_open', 1.1)
 
         self._load_placing_config()
 
@@ -85,7 +92,12 @@ class PlacingStrategy:
 
     def go_to_start_pose(self):
         print(f"\n[起始姿态] 移动到保存的起始位置...")
-        self.arm.set_joint_angles(self.start_pose, duration=2.0)
+        # 保留当前夹爪角度，避免夹着物块时舵机挣扎干扰总线
+        pose = list(self.start_pose)
+        cur_ang = self.arm.get_joint_angles()
+        if cur_ang is not None:
+            pose[5] = cur_ang[5]
+        self.arm.set_joint_angles(pose, duration=2.0)
         time.sleep(0.5)
         print("[起始姿态] ✓ 已到达起始位置")
 

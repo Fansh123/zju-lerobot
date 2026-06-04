@@ -4,6 +4,8 @@
 """
 
 import numpy as np
+import os
+import yaml
 from typing import Optional, Dict
 from wrist_camera import WristCamera
 
@@ -11,9 +13,7 @@ from wrist_camera import WristCamera
 class ObjectDetector:
     """物体检测类 - 只检测红色正方体"""
     
-    REAL_OBJECT_SIZE = 0.022
-    
-    def __init__(self, camera: WristCamera = None, camera_id: int = 0):
+    def __init__(self, camera: WristCamera = None, camera_id: int = None):
         self.camera = camera if camera else WristCamera(camera_id)
     
     def detect_cube(self, frame: np.ndarray = None) -> Optional[Dict]:

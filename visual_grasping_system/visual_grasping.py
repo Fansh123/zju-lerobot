@@ -7,6 +7,7 @@ import numpy as np
 import time
 import argparse
 import os
+import yaml
 from typing import Optional, Dict
 
 from soarm101_sdk_urdf import SOARM101Controller
@@ -15,23 +16,38 @@ from object_detector import ObjectDetector
 from grasping_strategy import GraspExecutor, VisualServoGrasp
 from placing_strategy import PlacingStrategy
 
+CONFIG_DIR = os.path.dirname(__file__)
+
+
+def _load_sys_cfg():
+    path = os.path.join(CONFIG_DIR, 'system_config.yaml')
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
 
 class VisualGrasping:
     """视觉抓取主类"""
     
-    def __init__(self, arm_port: str = 'COM18', camera_id: int = 0):
-        self.arm_port = arm_port
-        self.camera_id = camera_id
+    def __init__(self, arm_port: str = None, camera_id: int = None):
+        sys_cfg = _load_sys_cfg()
+        arm_cfg = sys_cfg.get('arm', {})
+        cam_cfg = sys_cfg.get('camera', {})
+
+        self.arm_port = arm_port if arm_port is not None else arm_cfg.get('port', 'COM18')
+        self.camera_id = camera_id if camera_id is not None else cam_cfg.get('camera_id', 1)
         
-        urdf_path = os.path.join(os.path.dirname(__file__), '..', 'SO-ARM100', 'Simulation', 'SO101', 'so101_new_calib.urdf')
+        urdf_rel = arm_cfg.get('urdf_path', '../SO-ARM100/Simulation/SO101/so101_new_calib.urdf')
+        urdf_path = os.path.join(CONFIG_DIR, urdf_rel)
         if not os.path.exists(urdf_path):
             urdf_path = None
             print("[WARN] 未找到URDF文件")
         
         print("[INIT] 创建机械臂控制器...")
-        self.arm = SOARM101Controller(arm_port, urdf_path=urdf_path)
+        self.arm = SOARM101Controller(self.arm_port, urdf_path=urdf_path)
         print("[INIT] 初始化摄像头...")
-        self.camera = WristCamera(camera_id)
+        self.camera = WristCamera(camera_id=self.camera_id)
         print("[INIT] 创建物体检测器...")
         self.detector = ObjectDetector(self.camera)
         self.grasp_executor = None

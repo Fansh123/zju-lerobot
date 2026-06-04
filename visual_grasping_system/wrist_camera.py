@@ -4,27 +4,54 @@
 """
 
 import numpy as np
+import os
+import yaml
 from typing import Optional, Tuple, Dict
+
+
+def _load_sys_cfg():
+    path = os.path.join(os.path.dirname(__file__), 'system_config.yaml')
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    return {}
 
 
 class WristCamera:
     """腕部摄像头类"""
     
-    REAL_OBJECT_SIZE = 0.022
-    
-    def __init__(self, camera_id: int = 0, resolution: Tuple[int, int] = (640, 480)):
-        self.camera_id = camera_id
-        self.resolution = resolution
+    def __init__(self, camera_id: int = None, resolution: Tuple[int, int] = None):
+        cfg = _load_sys_cfg().get('camera', {})
+
+        self.camera_id = camera_id if camera_id is not None else cfg.get('camera_id', 1)
+        self.resolution = resolution if resolution is not None else tuple(cfg.get('resolution', [640, 480]))
         self.cap = None
         self.cv2 = None
         self.initialized = False
         
         self._init_camera()
-        
-        self.red_hsv_low1 = np.array([0, 100, 100])
-        self.red_hsv_high1 = np.array([10, 255, 255])
-        self.red_hsv_low2 = np.array([160, 100, 100])
-        self.red_hsv_high2 = np.array([180, 255, 255])
+
+        rh = cfg.get('red_hsv', {})
+        self.red_hsv_low1 = np.array([
+            rh.get('h_low1', 0), rh.get('s_low1', 100), rh.get('v_low1', 100)
+        ])
+        self.red_hsv_high1 = np.array([
+            rh.get('h_high1', 10), rh.get('s_high1', 255), rh.get('v_high1', 255)
+        ])
+        self.red_hsv_low2 = np.array([
+            rh.get('h_low2', 160), rh.get('s_low2', 100), rh.get('v_low2', 100)
+        ])
+        self.red_hsv_high2 = np.array([
+            rh.get('h_high2', 180), rh.get('s_high2', 255), rh.get('v_high2', 255)
+        ])
+
+        bh = cfg.get('blue_hsv', {})
+        self.blue_hsv_low = np.array([
+            bh.get('h_low', 100), bh.get('s_low', 100), bh.get('v_low', 100)
+        ])
+        self.blue_hsv_high = np.array([
+            bh.get('h_high', 130), bh.get('s_high', 255), bh.get('v_high', 255)
+        ])
         
     def _init_camera(self):
         try:
@@ -83,6 +110,69 @@ class WristCamera:
         mask1 = self.cv2.inRange(hsv, self.red_hsv_low1, self.red_hsv_high1)
         mask2 = self.cv2.inRange(hsv, self.red_hsv_low2, self.red_hsv_high2)
         mask = self.cv2.bitwise_or(mask1, mask2)
+        
+        kernel = np.ones((5, 5), np.uint8)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, kernel)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel)
+        
+        contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+        
+        valid_cubes = []
+        for contour in contours:
+            area = self.cv2.contourArea(contour)
+            if area < min_area:
+                continue
+            
+            peri = self.cv2.arcLength(contour, True)
+            approx = self.cv2.approxPolyDP(contour, 0.04 * peri, True)
+            
+            if len(approx) >= 4 and len(approx) <= 6:
+                x, y, w, h = self.cv2.boundingRect(contour)
+                aspect_ratio = w / h if h > 0 else 1
+                
+                if 0.6 < aspect_ratio < 1.7:
+                    M = self.cv2.moments(contour)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        
+                        pixel_size = (w + h) / 2
+                        
+                        valid_cubes.append({
+                            'center': (cx, cy),
+                            'pixel_size': pixel_size,
+                            'bbox': (x, y, w, h),
+                            'area': area,
+                            'contour': contour
+                        })
+        
+        if not valid_cubes:
+            return None
+        
+        return max(valid_cubes, key=lambda x: x['area'])
+
+    def detect_blue_cube(self, frame: np.ndarray = None, min_area: int = 200) -> Optional[Dict]:
+        """
+        检测蓝色正方体
+        
+        Returns:
+            Dict with keys:
+            - 'center': (cx, cy) 图像中心坐标
+            - 'pixel_size': 物块在图像中的像素尺寸
+            - 'bbox': (x, y, w, h) 边界框
+            - 'area': 面积
+        """
+        if frame is None:
+            frame = self.get_frame()
+        
+        if frame is None:
+            return None
+        
+        hsv = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2HSV)
+        mask = self.cv2.inRange(hsv, self.blue_hsv_low, self.blue_hsv_high)
         
         kernel = np.ones((5, 5), np.uint8)
         mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, kernel)

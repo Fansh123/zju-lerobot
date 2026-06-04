@@ -8,8 +8,17 @@ import serial
 import time
 import numpy as np
 import os
+import yaml
 import yourdfpy
 from typing import List, Tuple, Optional
+
+
+def _load_sys_cfg():
+    path = os.path.join(os.path.dirname(__file__), 'system_config.yaml')
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    return {}
 
 
 class FeetechSTS:
@@ -180,22 +189,25 @@ class SOARM101Controller:
         [-1.66, 1.66], [-2.74, 2.84], [-1.06, 1.22]
     ])
     
-    GRIPPER_CLOSE_ANGLE = -1.0
-    GRIPPER_OPEN_ANGLE = 1.1
-    
-    DEFAULT_SPEED = 500
-    DEFAULT_ACCELERATION = 50
-    
-    def __init__(self, port: str = 'COM18', urdf_path: str = None):
-        self.bus = FeetechSTS(port, baudrate=1000000)
+    def __init__(self, port: str = None, urdf_path: str = None):
+        cfg = _load_sys_cfg().get('arm', {})
+
+        port = port if port is not None else cfg.get('port', 'COM18')
+        baudrate = cfg.get('baudrate', 1000000)
+        self.bus = FeetechSTS(port, baudrate=baudrate)
+
         self.connected = False
         self.current_positions = np.full(6, FeetechSTS.POS_CENTER)
-        self._speed = self.DEFAULT_SPEED
-        self._acceleration = self.DEFAULT_ACCELERATION
+        self._speed = cfg.get('default_speed', 500)
+        self._acceleration = cfg.get('default_acceleration', 50)
         
         self.urdf = None
         self.joint_names_urdf = None
         self.ee_link_name = "gripper_frame_link"
+
+        grp_cfg = _load_sys_cfg().get('grasping', {})
+        self.GRIPPER_CLOSE_ANGLE = grp_cfg.get('gripper_close', -1.0)
+        self.GRIPPER_OPEN_ANGLE = grp_cfg.get('gripper_open', 1.1)
         
         if urdf_path:
             self._load_urdf(urdf_path)

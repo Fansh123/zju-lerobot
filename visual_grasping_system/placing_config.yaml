@@ -1,5 +1,5 @@
-center_offset_deg: 5
-forward_coefficient: 0.0006
+center_offset_deg: 3
+forward_coefficient: 0.00065
 start_pose:
 - 0.08897088569736719
 - -1.0906603401866908
