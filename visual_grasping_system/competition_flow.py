@@ -309,8 +309,10 @@ def main():
     print("  设置高度 (单位: 米):")
     print("    a. 设置取货区抓取Z高度")
     print("    b. 设置装货区放置Z高度")
-    print("    c. 设置救援区抓取Z高度")
+    print("    e. 设置救援区抓取Z高度")
     print("    d. 设置救援区放置Z高度")
+    print("  控制:")
+    print("    t. 切换舵机扭矩 (Torque ON/OFF - 手动摆位时需关掉)")
     print("  运行:")
     print("    7. 运行完整流程")
     print("    8. 仅运行取货区(Phase 1)")
@@ -351,7 +353,7 @@ def main():
                 flow._reload()
             except ValueError:
                 print("[ERROR] 请输入有效数字")
-        elif cmd == 'c':
+        elif cmd == 'e':
             try:
                 v = float(input("救援区抓取Z高度(米): ").strip())
                 flow.cfg['rescue_grasp_z'] = v
@@ -367,6 +369,18 @@ def main():
                 flow._reload()
             except ValueError:
                 print("[ERROR] 请输入有效数字")
+        elif cmd == 't':
+            torque_on = getattr(arm, '_torque_on', True)
+            if torque_on:
+                for i in range(6):
+                    arm.bus.enable_torque(i + 1, False)
+                arm._torque_on = False
+                print("\n[Torque] 舵机扭矩已关闭, 请手动摆好各个位置后按 t 重新开启")
+            else:
+                for i in range(6):
+                    arm.bus.enable_torque(i + 1, True)
+                arm._torque_on = True
+                print("\n[Torque] 舵机扭矩已开启, 可以保存位置或运行流程")
         elif cmd == '7':
             flow.run_full()
         elif cmd == '8':
