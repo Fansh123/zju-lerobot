@@ -41,7 +41,7 @@ class PlacingStrategy:
     """视觉伺服放置策略"""
 
     def __init__(self, arm: SOARM101Controller, camera: WristCamera = None,
-                 camera_id: int = None):
+                 camera_id: int = None, place_z: float = None, retract_z: float = None):
         self.arm = arm
         self.camera = camera if camera else WristCamera(camera_id)
 
@@ -54,8 +54,8 @@ class PlacingStrategy:
         self.MAX_ITER = plc.get('max_iter', 60)
         self.JOINT_STEP = plc.get('joint_step', 0.025)
         self.FORWARD_COEFFICIENT = plc.get('forward_coefficient', 0.0015)
-        self.PLACE_Z = plc.get('place_z', 0.015)
-        self.RETRACT_Z = plc.get('retract_z', 0.12)
+        self.PLACE_Z = place_z if place_z is not None else plc.get('place_z', 0.015)
+        self.RETRACT_Z = retract_z if retract_z is not None else plc.get('retract_z', 0.12)
         self.GRIPPER_OPEN = plc.get('gripper_open', 1.1)
 
         self._load_placing_config()

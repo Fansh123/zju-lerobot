@@ -23,7 +23,8 @@ def _load_sys_cfg():
 class VisualServoGrasp:
     """视觉伺服抓取类"""
     
-    def __init__(self, arm: SOARM101Controller, camera: WristCamera, target_color: str = 'red'):
+    def __init__(self, arm: SOARM101Controller, camera: WristCamera, target_color: str = 'red',
+                 grasp_z: float = None):
         self.arm = arm
         self.camera = camera
 
@@ -32,7 +33,7 @@ class VisualServoGrasp:
         self.CENTER_THRESHOLD_Y = cfg.get('center_threshold_y', 20)
         self.MAX_ITERATIONS = cfg.get('max_iterations', 50)
         self.JOINT_STEP = cfg.get('joint_step', 0.03)
-        self.GRASP_Z = cfg.get('grasp_z', 0.010)
+        self.GRASP_Z = grasp_z if grasp_z is not None else cfg.get('grasp_z', 0.010)
         self.FORWARD_DISTANCE = cfg.get('forward_distance', 0.1)
         self.GRIPPER_OPEN = cfg.get('gripper_open', 1.1)
         self.GRIPPER_CLOSE = cfg.get('gripper_close', -1.0)
@@ -316,19 +317,11 @@ class VisualServoGrasp:
                 self.arm.move_to_xyz([current_pos[0], current_pos[1], self.GRASP_Z], duration=1.5)
             time.sleep(0.5)
 
-            angles_after_descend = self.arm.get_joint_angles()
-            wrist_z_at_grasp = None
-            if angles_after_descend is not None:
-                wrist_z_at_grasp = self.arm.get_wrist_position(angles_after_descend[:5])[2]
-                print(f"[步骤5] 当前腕部Z高度: {wrist_z_at_grasp*1000:.1f}mm, 将保持此高度前进")
-
-            print("\n[步骤5] 向前移动100mm (沿关节0径向, 保持腕部Z不变)...")
+            print("\n[步骤5] 向前移动100mm (沿关节0径向)...")
+            self._grasp_lift_target = None  # 保存目标位置，步骤7提升用
             current_pos = self.arm.get_current_xyz()
             if current_pos is not None:
                 ang_step5 = self.arm.get_joint_angles()
-                if ang_step5 is not None and wrist_z_at_grasp is None:
-                    wrist_z_at_grasp = self.arm.get_wrist_position(ang_step5[:5])[2]
-                    print(f"[步骤5] 当前腕部Z高度: {wrist_z_at_grasp*1000:.1f}mm, 将保持此高度前进")
                 # 沿关节0(shoulder_link)→末端的径向方向前进，与摄像头视角匹配
                 target_x = current_pos[0] + self.FORWARD_DISTANCE
                 target_y = current_pos[1]
@@ -342,12 +335,11 @@ class VisualServoGrasp:
                         target_y = current_pos[1] + (dy / dist_xy) * self.FORWARD_DISTANCE
                         print(f"  关节0中心: ({shoulder_pos[0]*1000:.1f}, {shoulder_pos[1]*1000:.1f}) mm")
                         print(f"  径向方向: ({dx/dist_xy:.3f}, {dy/dist_xy:.3f})")
-                target_z = current_pos[2]  # 保持当前Z不变，避免步骤4.5漂移后回拉
-                self.arm.move_linear([target_x, target_y, target_z],
-                                     wrist_z=wrist_z_at_grasp,
+                target_z = current_pos[2]  # 保持当前Z不变
+                self._grasp_lift_target = [target_x, target_y, target_z]
+                self.arm.move_linear(self._grasp_lift_target,
                                      duration=1.5,
-                                     num_steps=30,
-                                     free_joints=[0,1,2,3])
+                                     num_steps=30)
             time.sleep(0.5)
             
             print("\n[步骤6] 闭合夹爪...")
@@ -358,7 +350,13 @@ class VisualServoGrasp:
             time.sleep(0.5)
             
             print("\n[步骤7] 提升物体...")
-            self.arm.move_relative(dz=0.1, duration=1.5)
+            if self._grasp_lift_target is not None:
+                # 基于步骤5的目标位置提升，避免 FK 漂移
+                lift_target = [self._grasp_lift_target[0], self._grasp_lift_target[1], self._grasp_lift_target[2] + 0.1]
+                print(f"  提升目标: ({lift_target[0]*1000:.1f}, {lift_target[1]*1000:.1f}, {lift_target[2]*1000:.1f}) mm")
+                self.arm.move_to_xyz(lift_target, duration=1.5)
+            else:
+                self.arm.move_relative(dz=0.1, duration=1.5)
             time.sleep(0.5)
             
             print("\n" + "="*60)

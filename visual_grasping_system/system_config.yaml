@@ -60,7 +60,7 @@ grasping:
   max_iterations: 50            # 居中循环最大迭代次数
   joint_step: 0.03              # 关节0每次调整步长 (弧度), 约1.72°
 
-  grasp_z: 0.005               # 抓取时末端Z高度 (米), 即夹爪下探到10mm桌面高度
+  grasp_z: 0.005               # 抓取时末端Z高度 (米), 即夹爪下探到5mm桌面高度
   forward_distance: 0.100       # 向前移动距离 (米), 沿关节0径向方向
 
   gripper_open: 1.1             # 夹爪张开角度 (70°→rad)
