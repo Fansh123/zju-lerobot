@@ -19,7 +19,7 @@ arm:
 #  摄像头参数
 # ---------------------------------------------------------------------------
 camera:
-  camera_id: 1                 # 摄像头设备ID (默认1=外接USB摄像头, 0=内置摄像头)
+  camera_id: 11                # 摄像头设备ID (EVA上USB摄像头=11)
   resolution: [640, 480]       # 分辨率 [宽, 高]
   image_center_x: 320          # 画面中心X坐标 (宽/2)
   image_center_y: 240          # 画面中心Y坐标 (高/2)
@@ -61,9 +61,9 @@ grasping:
   joint_step: 0.03              # 关节0每次调整步长 (弧度), 约1.72°
 
   grasp_z: 0.005               # 抓取时末端Z高度 (米), 即夹爪下探到5mm桌面高度
-  forward_distance: 0.100       # 向前移动距离 (米), 沿关节0径向方向
+  forward_distance: 0.1      # 向前移动距离 (米), 沿关节0径向方向
 
-  gripper_open: 1.1             # 夹爪张开角度 (70°→rad)
+  gripper_open: 0             # 夹爪张开角度 (70°→rad)
   gripper_close: -1.1           # 夹爪闭合角度 (-57°→rad)
   wrist_roll_angle: -1.5708     # 腕部旋转角 = -π/2, 摄像头横装转90°
 
@@ -86,7 +86,7 @@ placing:
   max_iter: 60                  # 居中循环最大迭代次数
   joint_step: 0.025             # 关节0每次调整步长 (弧度), 约1.43°
 
-  forward_coefficient: 0.0015   # 前进距离系数 (米/像素), 前进距离 = |X偏差| × 系数
+  forward_coefficient: 0.0012   # 前进距离系数 (米/像素), 前进距离 = |X偏差| × 系数
   place_z: 0.015                # 放置时末端Z高度 (米), 即放到15mm高度
   retract_z: 0.12               # 放置后提升高度 (米), 从当前Z升高120mm
 
